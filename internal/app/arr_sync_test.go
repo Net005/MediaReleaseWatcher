@@ -76,7 +76,7 @@ func TestArrPresenceRoutesAndSiloConnectionAreReadOnly(t *testing.T) {
 }
 
 func TestArrSearchLeaseRequiresActualOwnershipAndSerializesProbes(t *testing.T) {
-	a := schedulerAppDatabase(t, "postgres://hermes@127.0.0.1:55473/mrw_arr_review_fix?sslmode=disable")
+	a := schedulerApp(t)
 	ctx, cancel := context.WithTimeout(a.ctx, 10*time.Second)
 	defer cancel()
 	lease, err := a.searchPresenceLease(ctx)

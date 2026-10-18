@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -68,13 +70,12 @@ func TestScheduleCalendarRecurrencesAndDST(t *testing.T) {
 
 func schedulerApp(t *testing.T) *App {
 	t.Helper()
-	return schedulerAppDatabase(t, "postgres://hermes@127.0.0.1:55473/mrw_schedule_test?sslmode=disable")
-}
-
-func schedulerAppDatabase(t *testing.T, url string) *App {
-	t.Helper()
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; PostgreSQL integration test")
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	pc, err := pgxpool.ParseConfig(url)
+	pc, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +117,18 @@ func schedulerAppDatabase(t *testing.T, url string) *App {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := &App{db: db, cipher: cipher, ctx: ctx, cancel: cancel}
+	// Preserve the caller's host, credentials and connection options for startup
+	// tests, adding only this fixture's isolated schema.
+	scopedURL := databaseURL
+	if parsed, parseErr := url.Parse(databaseURL); parseErr == nil && (parsed.Scheme == "postgres" || parsed.Scheme == "postgresql") {
+		query := parsed.Query()
+		query.Set("search_path", schema)
+		parsed.RawQuery = query.Encode()
+		scopedURL = parsed.String()
+	} else {
+		scopedURL += " search_path=" + schema
+	}
+	a := &App{db: db, cipher: cipher, cfg: Config{DatabaseURL: scopedURL}, ctx: ctx, cancel: cancel}
 	t.Cleanup(func() {
 		cancel()
 		a.wg.Wait()
@@ -531,7 +543,7 @@ func TestSchedulePostgresSearchConsentAndBoundedExecution(t *testing.T) {
 func TestSchedulePostgresSearchPartialSeries(t *testing.T) {
 	for _, statistics := range []string{`{"episodeFileCount":1,"episodeCount":2}`, `{"episodeFileCount":1}`} {
 		t.Run(statistics, func(t *testing.T) {
-			a := schedulerAppDatabase(t, "postgres://hermes@127.0.0.1:55473/mrw_arr_review_fix?sslmode=disable")
+			a := schedulerApp(t)
 			var writes atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch {
@@ -592,7 +604,7 @@ func TestSchedulePostgresSearchLostSharedLease(t *testing.T) {
 		{"blocked identity cancellation", "/api/v3/movie/7", true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			a := schedulerAppDatabase(t, "postgres://hermes@127.0.0.1:55473/mrw_arr_review_fix?sslmode=disable")
+			a := schedulerApp(t)
 			ctx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
 			defer cancel()
 			// A distinct instance/pool, but the same application schema/database.
@@ -600,7 +612,7 @@ func TestSchedulePostgresSearchLostSharedLease(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.Close()
+			defer func() { cancel(); db.Close() }()
 			b := &App{db: db, cipher: a.cipher, ctx: ctx}
 			schedulerRelease(t, a, "movie", 42, 0, true)
 			entered, unblock := make(chan struct{}), make(chan struct{})
@@ -670,10 +682,10 @@ func TestSchedulePostgresSearchLostSharedLease(t *testing.T) {
 			// database's exact one-bigint shared search lock holder is eligible.
 			var terminated bool
 			var leasePID int32
-			if err := b.db.QueryRow(ctx, `SELECT pid FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND current_database()='mrw_arr_review_fix' AND classid=0 AND objid=486722127 AND objsubid=1 AND granted`).Scan(&leasePID); err != nil {
+			if err := b.db.QueryRow(ctx, `SELECT pid FROM pg_locks WHERE locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND classid=0 AND objid=486722127 AND objsubid=1 AND granted`).Scan(&leasePID); err != nil {
 				t.Fatal(err)
 			}
-			err = b.db.QueryRow(ctx, `SELECT pg_terminate_backend(pid) FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND current_database()='mrw_arr_review_fix' AND classid=0 AND objid=486722127 AND objsubid=1 AND granted`, leasePID).Scan(&terminated)
+			err = b.db.QueryRow(ctx, `SELECT pg_terminate_backend(pid) FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND classid=0 AND objid=486722127 AND objsubid=1 AND granted`, leasePID).Scan(&terminated)
 			if err != nil || !terminated {
 				t.Fatalf("terminate shared lease: %t %v", terminated, err)
 			}
@@ -969,7 +981,7 @@ func TestSchedulePostgresNewAndStartUsePersistedTasks(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := Config{
-		DatabaseURL: "postgres://hermes@127.0.0.1:55473/mrw_schedule_test?sslmode=disable&search_path=" + a.db.Config().ConnConfig.RuntimeParams["search_path"],
+		DatabaseURL: a.cfg.DatabaseURL,
 		Secret:      "synthetic-scheduler-test-secret-at-least-32-characters",
 		DataDir:     t.TempDir(),
 	}

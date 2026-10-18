@@ -24,7 +24,7 @@ func TestSchedulePostgresSearchSeriesCoverage(t *testing.T) {
 		{"more files", `{"episodeFileCount":3,"episodeCount":2}`, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			a := schedulerAppDatabase(t, "postgres://hermes@127.0.0.1:55473/mrw_arr_review_fix?sslmode=disable")
+			a := schedulerApp(t)
 			var searches atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
@@ -81,7 +81,7 @@ func TestSchedulePostgresSeriesCoverageKeepsConsentAndIdentityGates(t *testing.T
 	for _, statistics := range []string{`{"episodeFileCount":1,"episodeCount":2}`, `{"episodeFileCount":1}`} {
 		for _, gate := range []string{"task", "automation", "integration", "search", "url", "key", "catalogue monitoring", "manager monitoring", "identity"} {
 			t.Run(statistics+"/"+gate, func(t *testing.T) {
-				a := schedulerAppDatabase(t, "postgres://hermes@127.0.0.1:55473/mrw_arr_review_fix?sslmode=disable")
+				a := schedulerApp(t)
 				var searches atomic.Int32
 				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 					switch {
