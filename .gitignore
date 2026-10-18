@@ -1,0 +1,17 @@
+# Keep runtime account data and secrets out of version control.
+.env
+.env.*
+!.env.example
+.runtime/
+data/
+backups/
+*.log
+bin/
+coverage.out
+node_modules/
+playwright-report/
+test-results/
+__pycache__/
+*.py[cod]
+/media-release-watcher
+.DS_Store

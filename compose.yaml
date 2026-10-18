@@ -1,0 +1,61 @@
+name: media-release-watcher
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-media_release_watcher}
+      POSTGRES_USER: ${POSTGRES_USER:-media_release_watcher}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run python3 scripts/configure.py first}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+    networks: [backend]
+
+  app:
+    image: ghcr.io/net005/mediareleasewatcher:${MRW_IMAGE_TAG:-latest}
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-media_release_watcher}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-media_release_watcher}?sslmode=disable
+      APP_ADDR: :8080
+      APP_SECRET: ${APP_SECRET:?Run python3 scripts/configure.py first}
+      DATA_DIR: /data
+      MDBLIST_API_KEY: ${MDBLIST_API_KEY:-}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      TZ: ${TZ:-UTC}
+    ports:
+      - '${APP_BIND:-127.0.0.1}:${APP_PORT:-8317}:8080'
+    volumes:
+      - artwork-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:8080/healthz]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+    stop_grace_period: 30s
+    networks: [backend]
+
+networks:
+  backend:
+volumes:
+  postgres-data:
+  artwork-data:

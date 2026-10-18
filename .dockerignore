@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+.runtime
+node_modules
+data
+backups
+bin
+test-results
+playwright-report
+*.log
+__pycache__
+**/__pycache__
+*.pyc
+media-release-watcher

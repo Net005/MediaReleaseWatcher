@@ -1,0 +1,8 @@
+# Opt-in source build: docker compose -f compose.yaml -f compose.build.yaml up -d --build
+services:
+  app:
+    image: media-release-watcher:local
+    pull_policy: build
+    build:
+      context: .
+      dockerfile: Dockerfile

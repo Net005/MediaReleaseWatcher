@@ -1,0 +1,7 @@
+# CI-only: test a locally built image, never pull a registry image or use real keys.
+services:
+  app:
+    image: media-release-watcher:ci
+    pull_policy: never
+    environment:
+      MDBLIST_API_KEY: ''
