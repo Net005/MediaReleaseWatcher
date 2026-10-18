@@ -18,6 +18,9 @@ type arrFixture struct {
 	media            Media
 	options          AddOptions
 	existing         []map[string]any
+	candidates       []map[string]any
+	lookupStatus     int
+	lookupRaw        string
 	lookup, verified map[string]any
 	posted           map[string]any
 	writes           atomic.Int32
@@ -58,7 +61,18 @@ func newArrFixture(t *testing.T, kind string) *arrFixture {
 			if r.URL.Query().Get("term") != f.term {
 				t.Errorf("term: %q", r.URL.Query().Get("term"))
 			}
-			json.NewEncoder(w).Encode([]map[string]any{f.lookup})
+			if f.lookupStatus != 0 {
+				w.WriteHeader(f.lookupStatus)
+			}
+			if f.lookupRaw != "" {
+				w.Write([]byte(f.lookupRaw))
+				return
+			}
+			if f.candidates != nil {
+				json.NewEncoder(w).Encode(f.candidates)
+			} else {
+				json.NewEncoder(w).Encode([]map[string]any{f.lookup})
+			}
 		case "POST /base/api/v3/" + resource:
 			f.writes.Add(1)
 			if err := json.NewDecoder(r.Body).Decode(&f.posted); err != nil {
@@ -224,6 +238,58 @@ func TestArrInvalidInputsNeverWrite(t *testing.T) {
 				t.Fatalf("unsafe write: %+v %v", got, err)
 			}
 		})
+	}
+}
+
+func TestArrAddRejectsAmbiguousAndIncompleteEvidenceBeforeWrite(t *testing.T) {
+	for _, kind := range []string{"radarr", "sonarr"} {
+		for _, scenario := range []string{"existing-duplicate", "lookup-duplicate", "lookup-conflict", "inventory-null", "inventory-missing-identity"} {
+			t.Run(kind+"/"+scenario, func(t *testing.T) {
+				f := newArrFixture(t, kind)
+				switch scenario {
+				case "existing-duplicate":
+					f.existing = []map[string]any{f.verified, f.verified}
+				case "lookup-duplicate":
+					f.candidates = []map[string]any{f.lookup, f.lookup}
+				case "lookup-conflict":
+					conflict := map[string]any{}
+					for k, v := range f.lookup {
+						conflict[k] = v
+					}
+					conflict["imdbId"] = "tt9999999"
+					f.candidates = []map[string]any{f.lookup, conflict}
+				case "inventory-null":
+					f.existing = nil
+				case "inventory-missing-identity":
+					f.existing = []map[string]any{{"id": float64(70), "title": "Synthetic Movie"}}
+				}
+				got, e := f.client().Add(context.Background(), kind, f.media, f.options)
+				if e == nil || got.ID != 0 || f.writes.Load() != 0 {
+					t.Fatalf("unsafe add %+v %v writes=%d", got, e, f.writes.Load())
+				}
+			})
+		}
+	}
+}
+
+func TestArrLookupErrorsAndMissingIdentityNeverWrite(t *testing.T) {
+	for _, kind := range []string{"radarr", "sonarr"} {
+		for _, tc := range []struct {
+			name, raw string
+			status    int
+		}{
+			{"rate-limit", "private body", 429}, {"provider-error", "private body", 503}, {"invalid-json", "not JSON", 200}, {"null", "null", 200}, {"empty", "[]", 200}, {"missing-identity", `[{"title":"Synthetic","titleSlug":"synthetic"}]`, 200},
+		} {
+			t.Run(kind+"/"+tc.name, func(t *testing.T) {
+				f := newArrFixture(t, kind)
+				f.lookupStatus = tc.status
+				f.lookupRaw = tc.raw
+				got, e := f.client().Add(context.Background(), kind, f.media, f.options)
+				if e == nil || got.ID != 0 || f.writes.Load() != 0 || strings.Contains(e.Error(), "private body") {
+					t.Fatalf("unsafe lookup %+v %v writes=%d", got, e, f.writes.Load())
+				}
+			})
+		}
 	}
 }
 

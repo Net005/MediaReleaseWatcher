@@ -19,6 +19,10 @@ type PersonLink struct {
 	Profile string `json:"profile"`
 }
 type Release struct {
+	LocalAvailability map[string]any    `json:"local_availability,omitempty"`
+	Cast              []CastPerson      `json:"cast,omitempty"`
+	Lists             []MDBListPolicy   `json:"lists"`
+	MonitoringOrigin  string            `json:"monitoring_origin"`
 	ID                int64             `json:"id"`
 	Title             string            `json:"title"`
 	Type              string            `json:"type"`
@@ -261,6 +265,7 @@ func normalizeRelease(raw json.RawMessage, kind string) (Release, []string, erro
 		}
 	}
 	people := castIDs(m)
+	r.Cast = castDetails(m)
 	if len(people) > 0 {
 		r.Coverage = "Matched only by explicit cast/person IDs supplied by MDBList."
 	}

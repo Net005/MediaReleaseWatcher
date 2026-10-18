@@ -6,7 +6,7 @@ import { chromium } from '@playwright/test';
 
 let browser, server, origin;
 const assets = new Map(await Promise.all(['index.html','app.js','styles.css'].map(async name => [name, await readFile(new URL('../'+name, import.meta.url),'utf8')])));
-const defaults = () => ({mdblist:{configured:false,list_ids:'',sync_interval_minutes:360},sonarr:{url:'',configured:false,quality_profile_id:0,root_folder:'',enabled:false,search:false},radarr:{url:'',configured:false,quality_profile_id:0,root_folder:'',enabled:false,search:false},pushover:{configured:false,enabled:false,device:''},automation:{enabled:false,notify_first_sync:false},public_url:''});
+const defaults = () => ({silo:{url:'',configured:false,enabled:false},mdblist:{configured:false,list_ids:'',sync_interval_minutes:360},sonarr:{url:'',configured:false,quality_profile_id:0,root_folder:'',enabled:false,search:false},radarr:{url:'',configured:false,quality_profile_id:0,root_folder:'',enabled:false,search:false},pushover:{configured:false,enabled:false,device:''},automation:{enabled:false,notify_first_sync:false},public_url:''});
 const release = () => ({id:1,title:'Handler test title',type:'movie',year:2026,tmdb_id:'654321',imdb_id:'tt7654321',description:'Test-only metadata.',genres:['Drama'],release_date:'2026-01-01',monitored:false,actresses:[],acquisition:{},content_info:{advisory:'Source supplied'},ratings:[],watch_providers:[]});
 const actress = () => ({id:2,name:'Handler test watch',tmdb_id:'123456',group:'',monitored:true,auto_add:false,notify:false,release_count:1,upcoming_count:0,metadata_status:'unknown'});
 
@@ -21,19 +21,26 @@ before(async () => {
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));origin=`http://127.0.0.1:${server.address().port}`;
 });
 after(async()=>{await browser?.close();if(server)await new Promise(resolve=>server.close(resolve));});
-async function app({authenticated=true,needsSetup=false,withRelease=false,configuredArr=false,hash=''}={}) {
+async function app({authenticated=true,needsSetup=false,withRelease=false,configuredArr=false,hash='',handle,autoScroll=false}={}) {
   const page=await browser.newPage();page.setDefaultTimeout(4000);
+  if(!autoScroll)await page.addInitScript(()=>{window.IntersectionObserver=undefined;});
   const requests=[],errors=[];page.on('pageerror',error=>errors.push(error.message));
   let settings=defaults(),item=release(),person=actress();
   if(configuredArr)settings.radarr={url:'http://arr.test',configured:true,enabled:true,search:true,root_folder:'/media/movies',quality_profile_id:7};
   await page.route('**/api/**',async route=>{
     const request=route.request(),url=new URL(request.url()),path=url.pathname,method=request.method();const body=request.postDataJSON();requests.push({path,method,body,query:Object.fromEntries(url.searchParams)});
+    const custom=await handle?.({path,method,body,query:Object.fromEntries(url.searchParams)});
+    if(custom){await route.fulfill({status:custom.status||200,contentType:'application/json',body:JSON.stringify(custom.data)});return;}
     let data={ok:true},status=200;
-    if(path==='/api/session')data={authenticated,needs_setup:needsSetup};
+    if(path==='/api/mdblist/lists')data={items:settings.mdblist.lists||[]};
+    else if(path==='/api/tasks')data={items:[]};
+    else if(path==='/api/silo/sync'||path==='/api/arr/sync'){data={ok:true};status=202;}
+    else if(path==='/api/releases/1/cast')data={items:[],coverage:'Source coverage unknown'};
+    else if(path==='/api/session')data={authenticated,needs_setup:needsSetup};
     else if(path==='/api/login'||path==='/api/setup'){authenticated=true;needsSetup=false;data={authenticated:true};}
     else if(path==='/api/logout')authenticated=false;
     else if(path==='/api/dashboard')data={stats:{releases:withRelease?1:0,actresses:1,upcoming:0,current:0,past:withRelease?1:0,monitored:0},featured:[],upcoming:[],recent:[],activity:[],sync:{running:false}};
-    else if(path==='/api/settings'){if(method==='PUT'){const old=settings;settings=body;for(const kind of ['mdblist','sonarr','radarr','pushover']){settings[kind].configured=old[kind].configured||Boolean(body[kind].api_key||body[kind].token);delete settings[kind].api_key;delete settings[kind].token;delete settings[kind].user;}}data=settings;}
+    else if(path==='/api/settings'){if(method==='PUT'){const old=settings;settings=structuredClone(body);for(const kind of ['mdblist','sonarr','radarr','pushover','silo']){settings[kind].configured=old[kind].configured||Boolean(body[kind].api_key||body[kind].token);delete settings[kind].api_key;delete settings[kind].token;delete settings[kind].user;}}data=settings;}
     else if(path==='/api/releases')data=method==='POST'?(withRelease=true,item):{items:withRelease?[item]:[],total:withRelease?1:0,page:Number(url.searchParams.get('page')||1),limit:Number(url.searchParams.get('limit')||36)};
     else if(path==='/api/releases/1'){if(method==='PATCH')item={...item,...body};data=item;}
     else if(path==='/api/releases/1/acquire'){item.acquisition.radarr='added';data={ok:true,result:{id:11,already_exists:false,url:'http://arr.test/movie/11'}};}
@@ -50,6 +57,290 @@ async function app({authenticated=true,needsSetup=false,withRelease=false,config
   await page.goto(origin+hash);
   return {page,requests,errors};
 }
+
+test('actress upcoming-only filter uses the API, persists across navigation and never narrows group cache',async()=>{
+  const {page,requests,errors}=await app({hash:'#/actresses',handle:({path,query})=>path==='/api/actresses'?{data:{items:query.upcoming_only==='true'?[]:[actress(),{...actress(),id:3,tmdb_id:'123457',group:'Synthetic group'}],total:query.upcoming_only==='true'?0:2}}:undefined});
+  try {
+    const upcoming=page.getByLabel('Upcoming releases only',{exact:true});await upcoming.check();
+    await page.getByText('No watches have upcoming releases.',{exact:true}).waitFor();
+    assert.equal(requests.filter(r=>r.path==='/api/actresses').at(-1).query.upcoming_only,'true');
+    assert.equal(await page.locator('#actress-group option[value="Synthetic group"]').count(),1);
+    await page.locator('[data-nav=releases]').click();await page.getByRole('heading',{name:'The collection.',exact:true}).waitFor();await page.locator('[data-nav=actresses]').click();
+    assert.equal(await upcoming.isChecked(),true);await upcoming.uncheck();await page.locator('.actress-card').nth(1).waitFor();
+    assert.equal(requests.filter(r=>r.path==='/api/actresses').at(-1).query.upcoming_only,undefined);assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('bulk watch import visibly reuses single-add fields and sends defaults without altering entry flags or groups',async()=>{
+  const entries=[{name:'Synthetic one',actor_id:'000123'},{name:'Synthetic two',actor_id:'000124',group:'Original group',monitored:false,auto_add:false,notify:true},{name:'Synthetic one duplicate',actor_id:'000123'}];
+  let imported=false;
+  const {page,requests,errors}=await app({hash:'#/actresses',handle:({path,method})=>{
+    if(path==='/api/actresses/import'&&method==='POST'){imported=true;return {data:{ok:true}};}
+    if(path==='/api/actresses'&&imported)return {data:{items:[{...actress(),tmdb_id:'000123'},{...actress(),id:3,tmdb_id:'000124'}],total:2}};
+  }});
+  try {
+    await page.getByRole('button',{name:'Add watch',exact:true}).click();let dialog=page.getByRole('dialog',{name:'Add an actress watch',exact:true});
+    const singleFields=await dialog.locator('[name=group],[name=monitored],[name=auto_add],[name=notify]').evaluateAll(nodes=>nodes.map(node=>({name:node.name,type:node.type,checked:node.checked||false})));
+    await dialog.getByRole('button',{name:'Cancel',exact:true}).click();await page.getByRole('button',{name:'Import',exact:true}).click();dialog=page.getByRole('dialog',{name:'Import actress watches',exact:true});
+    assert.deepEqual(await dialog.locator('[name=group],[name=monitored],[name=auto_add],[name=notify]').evaluateAll(nodes=>nodes.map(node=>({name:node.name,type:node.type,checked:node.checked||false}))),singleFields);
+    await dialog.getByText('Explicit entry flags and entry groups win; original groups mappings are preserved.',{exact:false}).waitFor();
+    await dialog.getByLabel('Group',{exact:true}).fill('Default synthetic group');await dialog.getByLabel('Monitor this actress',{exact:true}).uncheck();await dialog.getByLabel('Automatically add future matched releases',{exact:true}).check();
+    await dialog.getByLabel('Watch list JSON',{exact:true}).fill(JSON.stringify({entries,groups:{'Original group':['000124']}}));
+    await dialog.getByRole('button',{name:'Import watches',exact:true}).click();await dialog.waitFor({state:'detached'});
+    assert.deepEqual(requests.find(r=>r.path==='/api/actresses/import').body,{entries,groups:{'Original group':['000124']},group:'Default synthetic group',monitored:false,auto_add:true,notify:false});assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('MDBList watchlist unknown retries read-only then confirms add and removal with verified readbacks',async()=>{
+  let status='unknown',value=null;
+  const {page,requests,errors}=await app({withRelease:true,hash:'#/release/1',handle:({path,method,body})=>{
+    if(path==='/api/releases/1/watchlist'){
+      if(method==='POST'){value=body.in_watchlist;status=value?'present':'absent';return {data:{status,in_watchlist:value,verified:true}};}
+      return {data:{status,in_watchlist:value,error:status==='unknown'?'Synthetic provider unavailable':''}};
+    }
+  }});
+  try {
+    const detail=page.locator('dialog[data-release-id="1"]');await detail.getByText('MDBList watchlist status unknown',{exact:true}).waitFor();
+    assert.equal(requests.some(r=>r.path.endsWith('/watchlist')&&r.method==='POST'),false);assert.equal(await detail.getByRole('button',{name:'Add to MDBList watchlist',exact:true}).count(),0);
+    status='absent';value=false;await detail.getByRole('button',{name:'Retry watchlist status',exact:true}).click();await detail.getByText('Not in MDBList watchlist',{exact:true}).waitFor();
+    await detail.getByRole('button',{name:'Add to MDBList watchlist',exact:true}).click();const add=page.getByRole('dialog',{name:'Add to MDBList watchlist?',exact:true});
+    assert.equal(requests.some(r=>r.path.endsWith('/watchlist')&&r.method==='POST'),false);await add.getByRole('button',{name:'Confirm watchlist add',exact:true}).click();
+    await detail.getByText('In MDBList watchlist',{exact:true}).waitFor();assert.deepEqual(requests.filter(r=>r.method==='POST'&&r.path.endsWith('/watchlist')).map(r=>r.body),[{in_watchlist:true}]);
+    assert.equal(requests.filter(r=>r.path.endsWith('/watchlist')).at(-1).method,'GET');
+    await detail.getByRole('button',{name:'Remove from MDBList watchlist',exact:true}).click();await page.getByRole('button',{name:'Confirm watchlist removal',exact:true}).click();await detail.getByText('Not in MDBList watchlist',{exact:true}).waitFor();
+    assert.deepEqual(requests.filter(r=>r.method==='POST'&&r.path.endsWith('/watchlist')).map(r=>r.body),[{in_watchlist:true},{in_watchlist:false}]);assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('unverified watchlist writes stay unknown and retry reads without repeating the write',async()=>{
+  let unverified=false;
+  const {page,requests,errors}=await app({withRelease:true,hash:'#/release/1',handle:({path,method})=>{
+    if(path==='/api/releases/1/watchlist'){
+      if(method==='POST'){unverified=true;return {data:{status:'present',in_watchlist:true,verified:false}};}
+      return {data:{status:unverified?'present':'absent',in_watchlist:unverified}};
+    }
+  }});
+  try {
+    const detail=page.locator('dialog[data-release-id="1"]');await detail.getByRole('button',{name:'Add to MDBList watchlist',exact:true}).click();await page.getByRole('button',{name:'Confirm watchlist add',exact:true}).click();
+    await detail.getByText('MDBList watchlist status unknown',{exact:true}).waitFor();await detail.getByText('The server did not verify the watchlist change. Retry the status check before taking another action.',{exact:true}).waitFor();
+    await detail.getByRole('button',{name:'Retry watchlist status',exact:true}).click();await detail.getByText('In MDBList watchlist',{exact:true}).waitFor();assert.equal(requests.filter(r=>r.path.endsWith('/watchlist')&&r.method==='POST').length,1);assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('scheduled tasks create and edit recurring Arr inventory, verify toggles, run now and delete',async()=>{
+  let tasks=[];
+  const {page,requests,errors}=await app({hash:'#/settings',handle:({path,method,body})=>{
+    if(path==='/api/tasks'){
+      if(method==='POST'){const task={...body,id:41,next_run:'2026-10-19T07:00:00Z',last_run:null,last_status:'never',last_error:''};tasks.push(task);return {status:201,data:task};}
+      return {data:{items:tasks}};
+    }
+    if(path==='/api/tasks/41'){
+      if(method==='PATCH')tasks[0]={...tasks[0],...body};if(method==='DELETE')tasks=[];return {data:tasks[0]||{ok:true}};
+    }
+    if(path==='/api/tasks/41/run'){tasks[0]={...tasks[0],last_run:'2026-10-18T12:01:00Z',last_status:'running'};return {status:202,data:{ok:true}};}
+  }});
+  try {
+    await page.getByRole('button',{name:'Add scheduled task',exact:true}).click();let dialog=page.getByRole('dialog',{name:'Add scheduled task',exact:true});
+    await dialog.getByLabel('Task name',{exact:true}).fill('Synthetic inventory');await dialog.getByLabel('Task type',{exact:true}).selectOption('arr_sync');await dialog.getByLabel('Recurrence',{exact:true}).selectOption('weekly');
+    await dialog.getByLabel('Start date',{exact:true}).fill('2026-10-19');await dialog.getByLabel('Time',{exact:true}).fill('09:00');await dialog.getByLabel('Timezone (IANA)',{exact:true}).fill('Europe/Amsterdam');await dialog.getByLabel('Monday',{exact:true}).check();await dialog.getByLabel('Friday',{exact:true}).check();
+    assert.equal(await dialog.getByLabel('Enable schedule',{exact:true}).isChecked(),false);await dialog.getByRole('button',{name:'Save task',exact:true}).click();await dialog.waitFor({state:'detached'});
+    let row=page.locator('[data-task-id="41"]');await row.getByText('Synthetic inventory',{exact:true}).waitFor();await row.getByText('Never run',{exact:true}).waitFor();
+    const created=requests.find(r=>r.path==='/api/tasks'&&r.method==='POST').body;assert.deepEqual(created,{name:'Synthetic inventory',type:'arr_sync',enabled:false,frequency:'weekly',date:'2026-10-19',time:'09:00',timezone:'Europe/Amsterdam',interval_minutes:60,weekdays:[1,5],allow_download_search:false});
+    await row.getByRole('button',{name:'Edit task',exact:true}).click();dialog=page.getByRole('dialog',{name:'Edit scheduled task',exact:true});await dialog.getByLabel('Task name',{exact:true}).fill('Updated inventory');await dialog.getByLabel('Recurrence',{exact:true}).selectOption('interval');await dialog.getByLabel('Interval (minutes)',{exact:true}).fill('120');await dialog.getByRole('button',{name:'Save task',exact:true}).click();await dialog.waitFor({state:'detached'});await row.getByText('Updated inventory',{exact:true}).waitFor();
+    await row.getByRole('button',{name:'Enable task',exact:true}).click();await row.getByRole('button',{name:'Disable task',exact:true}).waitFor();assert.equal(tasks[0].enabled,true);
+    await row.getByRole('button',{name:'Run now',exact:true}).click();await row.getByText('running',{exact:true}).waitFor();assert.equal(requests.filter(r=>r.path==='/api/tasks/41/run').at(-1).method,'POST');assert.equal(requests.filter(r=>r.path.startsWith('/api/tasks')).at(-1).method,'GET');
+    tasks[0].last_status='ok';await page.getByRole('button',{name:'Refresh scheduled tasks',exact:true}).click();await row.getByText('ok',{exact:true}).waitFor();
+    await row.getByRole('button',{name:'Delete task',exact:true}).click();await page.getByRole('button',{name:'Delete scheduled task',exact:true}).click();await page.getByText('No scheduled tasks yet.',{exact:true}).waitFor();assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('Arr inventory and readiness badges remain independent from Silo and failures never imply absence',async()=>{
+  const items=[
+    {...release(),id:1,acquisition:{radarr:'already_exists',radarr_status:'present',radarr_ready:'false',radarr_file_count:'0',radarr_url:'https://arr.test/movie/1'},local_availability:{status:'unknown'}},
+    {...release(),id:2,type:'show',acquisition:{sonarr:'already_exists',sonarr_status:'present',sonarr_ready:'true',sonarr_file_count:'5',sonarr_url:'javascript:alert(1)'},local_availability:{status:'absent'}},
+    {...release(),id:3,acquisition:{radarr_status:'absent'}},
+    {...release(),id:4,acquisition:{radarr:'already_exists',radarr_status:'present',radarr_error:'Synthetic inventory check failed'}}
+  ];
+  const {page,errors}=await app({hash:'#/releases',handle:({path})=>path==='/api/releases'?{data:{items,total:4,page:1,limit:36}}:undefined});
+  try {
+    const cards=page.locator('.release-card');await cards.nth(3).waitFor();await cards.nth(0).getByText('Radarr inventory: present',{exact:true}).waitFor();await cards.nth(0).getByText('Radarr readiness: not ready',{exact:true}).waitFor();await cards.nth(1).getByText('Sonarr readiness: ready · 5 files',{exact:true}).waitFor();
+    await cards.nth(2).getByText('Radarr inventory: absent',{exact:true}).waitFor();await cards.nth(3).getByText('Radarr inventory: unknown',{exact:true}).waitFor();await cards.nth(3).getByText('Synthetic inventory check failed',{exact:true}).waitFor();
+    assert.equal(await page.getByText('Local file available',{exact:true}).count(),0);assert.equal(await page.getByRole('link',{name:'Open Radarr',exact:true}).getAttribute('href'),'https://arr.test/movie/1');assert.equal(await page.getByRole('link',{name:'Open Sonarr',exact:true}).count(),0);assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('upgraded settings, cast and import layouts stay aligned and responsive',async()=>{
+  const {page,errors}=await app({withRelease:true,hash:'#/settings',handle:({path})=>path==='/api/releases/1/cast'?{data:{items:[{tmdb_id:'123',name:'Synthetic cast person',character:'Source role',profile:''}],coverage:'Source supplied'}}:undefined});
+  try {
+    await page.setViewportSize({width:1360,height:960});await page.locator('#task-list').waitFor();
+    assert.equal(await page.locator('.task-settings').evaluate(node=>getComputedStyle(node).gridColumnStart),'2');
+    const form=await page.locator('#settings-form').boundingBox(),tasks=await page.locator('#settings-schedules').boundingBox();assert.equal(Math.round(form.x),Math.round(tasks.x));
+    await page.setViewportSize({width:390,height:844});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    await page.locator('[data-nav=releases]').click();await page.locator('.release-card [data-action=release]').first().click();const detail=page.locator('dialog[data-release-id="1"]');await detail.locator('.cast-card').waitFor();
+    assert.equal(await detail.locator('.cast-grid').evaluate(node=>getComputedStyle(node).display),'grid');assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    if(process.env.MRW_SCREENSHOTS_DIR)await page.screenshot({path:process.env.MRW_SCREENSHOTS_DIR+'/release-mobile.png',fullPage:true});
+    await page.keyboard.press('Escape');await page.locator('[data-nav=actresses]').click();await page.getByRole('button',{name:'Import',exact:true}).click();await page.getByRole('dialog',{name:'Import actress watches',exact:true}).getByLabel('Notify on new matched releases',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);if(process.env.MRW_SCREENSHOTS_DIR)await page.screenshot({path:process.env.MRW_SCREENSHOTS_DIR+'/import-mobile.png',fullPage:true});assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('download-search tasks require per-task consent, saved connections and a separate run confirmation',async()=>{
+  let tasks=[];
+  const {page,requests,errors}=await app({hash:'#/settings',handle:({path,method,body})=>{
+    if(path==='/api/tasks'){
+      if(method==='POST'){tasks=[{...body,id:51,last_run:null,last_status:'',last_error:''}];return {status:201,data:tasks[0]};}
+      return {data:{items:tasks}};
+    }
+    if(path==='/api/tasks/51/run'){tasks[0]={...tasks[0],last_run:'2026-10-18T15:02:00Z',last_status:'running'};return {status:202,data:{ok:true}};}
+  }});
+  try {
+    await page.getByRole('button',{name:'Add scheduled task',exact:true}).click();const dialog=page.getByRole('dialog',{name:'Add scheduled task',exact:true});
+    await dialog.getByLabel('Task name',{exact:true}).fill('Synthetic monitored search');await dialog.getByLabel('Task type',{exact:true}).selectOption('search_missing');await dialog.getByLabel('Enable schedule',{exact:true}).check();
+    assert.equal(await dialog.getByLabel('Allow download searches for app-monitored missing releases',{exact:true}).isChecked(),false);await dialog.getByRole('button',{name:'Save task',exact:true}).click();await dialog.getByText('Enabled search tasks require explicit download-search consent.',{exact:true}).waitFor();assert.equal(requests.some(r=>r.path==='/api/tasks'&&r.method==='POST'),false);
+    await dialog.getByLabel('Allow download searches for app-monitored missing releases',{exact:true}).check();await dialog.getByRole('button',{name:'Save task',exact:true}).click();await dialog.waitFor({state:'detached'});assert.equal(requests.find(r=>r.path==='/api/tasks'&&r.method==='POST').body.allow_download_search,true);
+    const row=page.locator('[data-task-id="51"]');await row.getByRole('button',{name:'Run now',exact:true}).click();let confirm=page.getByRole('dialog',{name:'Run download searches now?',exact:true});await confirm.waitFor();assert.equal(requests.some(r=>r.path.endsWith('/51/run')),false);await confirm.getByRole('button',{name:'Cancel',exact:true}).click();
+    await page.locator('[name="public_url"]').fill('https://unsaved.test');await row.getByRole('button',{name:'Run now',exact:true}).click();await page.getByText('Save or reset settings before running tasks against saved connections.',{exact:true}).waitFor();assert.equal(requests.some(r=>r.path.endsWith('/51/run')),false);
+    await page.getByRole('button',{name:'Reset changes',exact:true}).click();await page.getByRole('button',{name:'Reset changes',exact:true}).last().click();await row.getByRole('button',{name:'Run now',exact:true}).click();confirm=page.getByRole('dialog',{name:'Run download searches now?',exact:true});await confirm.getByRole('button',{name:'Run monitored searches',exact:true}).click();await row.getByText('running',{exact:true}).waitFor();assert.equal(requests.filter(r=>r.path.endsWith('/51/run')).length,1);assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('scheduled-task errors and mismatched readbacks remain visible instead of claiming success',async()=>{
+  let fail=true;
+  const {page,requests,errors}=await app({hash:'#/settings',handle:({path,method})=>{
+    if(path==='/api/tasks'){
+      if(method==='POST')return {status:201,data:{id:61}};
+      if(fail){fail=false;return {status:502,data:{error:'Synthetic scheduler unavailable'}};}
+      return {data:{items:[]}};
+    }
+  }});
+  try {
+    await page.getByText('Synthetic scheduler unavailable',{exact:true}).waitFor();await page.getByRole('button',{name:'Retry scheduled tasks',exact:true}).click();await page.getByText('No scheduled tasks yet.',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'Add scheduled task',exact:true}).click();const dialog=page.getByRole('dialog',{name:'Add scheduled task',exact:true});await dialog.getByLabel('Task name',{exact:true}).fill('Unpersisted task');await dialog.getByRole('button',{name:'Save task',exact:true}).click();await dialog.getByText('Task readback did not match the requested settings. Refresh scheduled tasks before retrying.',{exact:true}).waitFor();assert.equal(await dialog.isVisible(),true);assert.equal(requests.filter(r=>r.path==='/api/tasks'&&r.method==='POST').length,1);assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('saved list policies immediately update release filters and preserve selection across navigation',async()=>{
+  const {page,requests,errors}=await app({hash:'#/settings',withRelease:true});
+  try {
+    await page.getByRole('button',{name:'Add personal list',exact:true}).click();const row=page.locator('.list-policy-row');await row.getByLabel('List ID',{exact:true}).fill('00042');await row.getByLabel('List name',{exact:true}).fill('New synthetic list');await row.getByLabel('Enabled',{exact:true}).check();await row.getByLabel('Monitor',{exact:true}).check();
+    await page.getByRole('button',{name:'Save settings',exact:true}).click();await page.getByText('All changes saved.',{exact:true}).waitFor();await page.locator('[data-nav=releases]').click();await page.getByLabel('Filter by personal list',{exact:true}).selectOption('00042');await page.locator('.release-card').waitFor();
+    await page.getByLabel('Media type',{exact:true}).selectOption('movie');await page.locator('.release-card').waitFor();await page.locator('[data-nav=actresses]').click();await page.getByRole('heading',{name:'Follow the people.',exact:true}).waitFor();await page.locator('[data-nav=releases]').click();await page.locator('.release-card').waitFor();
+    assert.equal(await page.getByLabel('Filter by personal list',{exact:true}).inputValue(),'00042');assert.equal(await page.getByLabel('Media type',{exact:true}).inputValue(),'movie');assert.equal(requests.filter(r=>r.path==='/api/releases'&&r.method==='GET').at(-1).query.list_id,'00042');assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('personal list settings start opted out and verify independent policies after save',async()=>{
+  const {page,requests,errors}=await app({hash:'#/settings'});
+  try {
+    await page.getByRole('button',{name:'Add personal list',exact:true}).click();
+    const row=page.locator('.list-policy-row');
+    for(const name of ['Enabled','Monitor','Auto-add'])assert.equal(await row.getByLabel(name,{exact:true}).isChecked(),false);
+    await row.getByLabel('List ID',{exact:true}).fill('0012');await row.getByLabel('List name',{exact:true}).fill('Personal synthetic list');
+    await row.getByLabel('Enabled',{exact:true}).check();
+    await page.getByRole('button',{name:'Save settings',exact:true}).click();
+    await page.getByText('All changes saved.',{exact:true}).waitFor();
+    assert.deepEqual(requests.find(r=>r.path==='/api/settings'&&r.method==='PUT').body.mdblist.lists,[{id:'0012',name:'Personal synthetic list',enabled:true,monitored:false,auto_add:false}]);
+    assert.equal(await page.locator('.list-policy-row').getByLabel('List ID',{exact:true}).inputValue(),'0012');assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('release scrolling appends unique titles, retries page errors, ends and resets personal-list filters',async()=>{
+  let fail=true;
+  const {page,requests,errors}=await app({hash:'#/releases',handle:({path,query})=>{
+    if(path==='/api/mdblist/lists')return {data:{items:[{id:'0012',name:'Personal synthetic list'}]}};
+    if(path==='/api/releases'){
+      const p=Number(query.page);if(p===2&&fail){fail=false;return {status:502,data:{error:'Synthetic page unavailable'}};}
+      const ids=query.list_id?[9]:p===1?[1,2]:[2,3];
+      return {data:{items:ids.map(id=>({...release(),id,title:`Release ${id}`})),page:p,limit:2,total:query.list_id?1:4}};
+    }
+  }});
+  try {
+    await page.locator('.release-card').nth(1).waitFor();
+    await page.getByRole('button',{name:'Load more releases',exact:true}).click();
+    await page.getByText('Synthetic page unavailable',{exact:true}).waitFor();assert.equal(await page.locator('.release-card').count(),2);
+    await page.getByRole('button',{name:'Try loading more',exact:true}).click();
+    await page.getByText('All matching releases loaded.',{exact:true}).waitFor();
+    assert.equal(await page.locator('.release-card').count(),3);
+    await page.getByLabel('Filter by personal list',{exact:true}).selectOption('0012');
+    await page.getByRole('button',{name:'View Release 9',exact:true}).waitFor();assert.equal(await page.locator('.release-card').count(),1);
+    assert.equal(requests.filter(r=>r.path==='/api/releases').at(-1).query.page,'1');assert.equal(requests.filter(r=>r.path==='/api/releases').at(-1).query.list_id,'0012');assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('release query changes abort stale requests before debounce and never replace newer results',async()=>{
+  const {page,errors}=await app({withRelease:true,hash:'#/releases'});let finish;
+  const gate=new Promise(resolve=>finish=resolve);const aborted=[];page.on('requestfailed',r=>{if(r.url().includes('/api/releases?'))aborted.push(r.url());});
+  await page.route('**/api/releases?*',async route=>{
+    const query=new URL(route.request().url()).searchParams;if(query.get('q')==='old')await gate;
+    await route.fulfill({contentType:'application/json',body:JSON.stringify({items:[{...release(),title:query.get('q')||'Initial'}],total:1,page:1,limit:36})});
+  });
+  try {
+    await page.locator('.release-card').waitFor();await page.getByLabel('Search your releases',{exact:true}).fill('old');
+    await page.waitForRequest(r=>new URL(r.url()).searchParams.get('q')==='old');
+    await page.getByLabel('Search your releases',{exact:true}).fill('new');
+    await page.getByRole('button',{name:'View new',exact:true}).waitFor();finish();
+    assert.equal(aborted.some(url=>new URL(url).searchParams.get('q')==='old'),true);assert.equal(await page.getByRole('button',{name:'View old',exact:true}).count(),0);assert.deepEqual(errors,[]);
+  }finally{finish();await page.close();}
+});
+
+test('intersection observer automatically loads the next release page on overview',async()=>{
+  const {page,requests,errors}=await app({autoScroll:true,handle:({path,query})=>path==='/api/releases'?{data:{items:[{...release(),id:Number(query.page),title:'Scroll '+query.page}],total:2,page:Number(query.page),limit:1}}:undefined});
+  try{await page.locator('#release-pagination').scrollIntoViewIfNeeded();await page.getByText('All matching releases loaded.',{exact:true}).waitFor();assert.equal(await page.locator('.release-card').count(),2);assert.equal(requests.filter(r=>r.path==='/api/releases').length,2);assert.deepEqual(errors,[]);}finally{await page.close();}
+});
+
+test('release cast opens source person details and explains list and actress monitoring separately from local files',async()=>{
+  const {page,errors}=await app({withRelease:true,hash:'#/release/1',handle:({path})=>{
+    if(path==='/api/releases/1')return {data:{...release(),monitoring_origin:'actress',monitored:true,lists:[{id:'0012',name:'Synthetic source',monitored:false,auto_add:false}],acquisition:{radarr:'already_exists'},local_availability:{status:'unknown',url:'javascript:alert(1)'}}};
+    if(path==='/api/releases/1/cast')return {data:{items:[{tmdb_id:'00123',name:'Synthetic actor <script>',character:'A role',profile:''}],coverage:'Verified source credits'}};
+    if(path==='/api/people/00123')return {data:{person:{tmdb_id:'00123',name:'Synthetic actor <script>',biography:'Source biography',metadata_status:'Verified biography'},releases:[release()]}};
+  }});
+  try {
+    const detail=page.locator('dialog[data-release-id="1"]');await detail.getByText('Synthetic source',{exact:false}).waitFor();await detail.getByText('Actress watch rule (Auto-add / Notify)',{exact:true}).waitFor();
+    await detail.getByRole('button',{name:'Already in Radarr',exact:true}).waitFor();await detail.getByText('Silo presence unknown',{exact:true}).waitFor();
+    await detail.getByRole('button',{name:'View person Synthetic actor <script>',exact:true}).click();
+    const person=page.getByRole('dialog',{name:'Person details',exact:true});await person.getByText('Source biography',{exact:true}).waitFor();await person.getByText('00123',{exact:true}).waitFor();assert.equal(await page.locator('script:not([src])').count(),0);assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('Silo saves redacted credentials, tests saved connection and queues independent read-only Silo and Arr inventory syncs',async()=>{
+  const {page,requests,errors}=await app({hash:'#/settings'});
+  try {
+    await page.getByLabel('Silo server URL',{exact:true}).fill('https://silo.test');await page.locator('[name="silo.api_key"]').fill('synthetic-only');await page.locator('[name="silo.enabled"]').check();
+    await page.getByRole('button',{name:'Save settings',exact:true}).click();await page.getByText('All changes saved.',{exact:true}).waitFor();
+    assert.equal(await page.locator('[name="silo.api_key"]').inputValue(),'');assert.deepEqual(requests.find(r=>r.method==='PUT').body.silo,{url:'https://silo.test',enabled:true,api_key:'synthetic-only'});
+    await page.getByRole('button',{name:'Test Silo connection',exact:true}).click();await page.locator('#silo-result').getByText('Connection verified.',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'Sync Silo availability',exact:true}).click();await page.locator('#silo-sync-result').getByText('Silo availability sync queued. Check Activity for completion.',{exact:true}).waitFor();
+    await page.getByRole('button',{name:'Sync Arr inventory',exact:true}).click();await page.locator('#arr-sync-result').getByText('Arr inventory sync queued. No download searches requested.',{exact:true}).waitFor();
+    for(const path of ['/api/silo/sync','/api/arr/sync'])assert.deepEqual(requests.find(r=>r.path===path).body,{});
+    assert.equal(requests.some(r=>r.path.includes('/acquire')),false);assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('Silo catalog presence has a safe In Silo link in cards and detail readback without health claims',async()=>{
+  const present={...release(),local_availability:{status:'available',url:'https://silo.test/base/item/movie:synthetic',checked_at:'2026-10-18T12:00:00Z'}};
+  const {page,requests,errors}=await app({hash:'#/releases',handle:({path})=>{
+    if(path==='/api/releases')return {data:{items:[present,{...present,id:2,local_availability:{...present.local_availability,url:'javascript:alert(1)'}}],total:2,page:1,limit:36}};
+    if(path==='/api/releases/1')return {data:present};
+  }});
+  try {
+    const first=page.locator('.release-card').first();await first.getByText('In Silo',{exact:true}).waitFor();
+    assert.equal(await page.getByText(/playback|playable|local file available|file indexed/i).count(),0);
+    assert.equal(await page.getByRole('link',{name:'Open in Silo',exact:true}).count(),1);assert.equal(await first.getByRole('link',{name:'Open in Silo',exact:true}).getAttribute('href'),present.local_availability.url);
+    await first.getByRole('button',{name:'View Handler test title',exact:true}).click();const detail=page.locator('dialog[data-release-id="1"]');
+    await detail.getByText('In Silo',{exact:true}).waitFor();
+    assert.equal(await detail.getByRole('link',{name:'Open in Silo',exact:true}).getAttribute('href'),present.local_availability.url);
+    assert.equal(requests.some(r=>r.path==='/api/releases/1'&&r.method==='GET'),true);assert.equal(requests.some(r=>r.path.includes('/acquire')),false);assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('Silo presence badges reflect catalog lookup and safe links, not Arr presence',async()=>{
+  const statuses=['available','absent','unknown','error'];
+  const {page,errors}=await app({hash:'#/releases',handle:({path})=>path==='/api/releases'?{data:{items:statuses.map((status,index)=>({...release(),id:index+1,acquisition:{radarr:index===3?'failed':'already_exists'},local_availability:{status,url:index===0?'https://silo.test/item/1':'javascript:alert(1)',checked_at:'2026-10-18T12:00:00Z'}})),total:4,page:1,limit:36}}:undefined});
+  try {
+    await page.locator('.release-card').nth(3).waitFor();for(const [index,label] of ['In Silo','Not in Silo','Silo presence unknown','Silo lookup failed'].entries())await page.locator('.release-card').nth(index).getByText(label,{exact:true}).waitFor();
+    assert.equal(await page.getByRole('link',{name:'Open in Silo',exact:true}).count(),1);assert.equal(await page.getByRole('link',{name:'Open in Silo',exact:true}).getAttribute('href'),'https://silo.test/item/1');assert.equal(await page.getByRole('button',{name:'Already in Radarr',exact:true}).count(),3);assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
 
 test('release detail supports verified monitoring and explicit single acquisition',async()=>{
   const {page,requests,errors}=await app({withRelease:true,configuredArr:true,hash:'#release/1'});

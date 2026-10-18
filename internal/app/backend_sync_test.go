@@ -90,9 +90,10 @@ func TestPostgresSyncPaginatedFeedsReorderedNumericBatchesAndBaseline(t *testing
 		}
 	}
 	var n int
-	if e = a.db.QueryRow(ctx, `SELECT count(*) FROM actions WHERE status='baseline'`).Scan(&n); e != nil || n != 8 {
+	if e = a.db.QueryRow(ctx, `SELECT count(DISTINCT (release_id,kind)) FROM actions WHERE status='baseline'`).Scan(&n); e != nil || n != 8 {
 		t.Fatalf("baseline not complete: %d %v", n, e)
 	}
+	assertSilentCurrentBaseline(t, a, 4)
 	if e = a.syncOnce(ctx); e != nil {
 		t.Fatal(e)
 	}
@@ -122,9 +123,10 @@ func TestPostgresOmittedEnrichmentStillCommitsSilentBaseline(t *testing.T) {
 		t.Fatalf("complete discovery baseline missing: %v %v", exists, e)
 	}
 	var n int
-	if e := a.db.QueryRow(ctx, `SELECT count(*) FROM actions WHERE status='baseline'`).Scan(&n); e != nil || n != 8 {
+	if e := a.db.QueryRow(ctx, `SELECT count(DISTINCT (release_id,kind)) FROM actions WHERE status='baseline'`).Scan(&n); e != nil || n != 8 {
 		t.Fatalf("omitted title not included in silent baseline: %d %v", n, e)
 	}
+	assertSilentCurrentBaseline(t, a, 4)
 	if e := a.db.QueryRow(ctx, `SELECT count(*) FROM activity WHERE kind='metadata' AND status='warning'`).Scan(&n); e != nil || n == 0 {
 		t.Fatal("partial metadata warning missing", e)
 	}

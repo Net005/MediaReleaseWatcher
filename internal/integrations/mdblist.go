@@ -30,10 +30,13 @@ func mdbPath(path string) bool {
 		return false
 	}
 	switch path {
-	case "/user", "/people/favorites/upcoming", "/catalog/movie", "/catalog/show", "/search/movie", "/search/show", "/search/any":
+	case "/user", "/lists/user", "/people/favorites/upcoming", "/catalog/movie", "/catalog/show", "/search/movie", "/search/show", "/search/any":
 		return true
 	}
 	p := strings.Split(strings.TrimPrefix(path, "/"), "/")
+	if len(p) == 2 && p[0] == "lists" {
+		return validID(p[1])
+	}
 	if len(p) == 2 && p[0] == "people" {
 		return validID(p[1])
 	}

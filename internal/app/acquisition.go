@@ -208,7 +208,7 @@ func (a *App) acquireActress(w http.ResponseWriter, r *http.Request) {
 }
 func (a *App) automate(ctx context.Context, s Settings, baseline bool) error {
 	// Capture decisions even while disabled: enabling later never releases historic backlog.
-	rows, e := a.db.Query(ctx, `SELECT r.id,bool_or(r.monitored AND COALESCE((p.data->>'monitored')::boolean,false) AND COALESCE((p.data->>'auto_add')::boolean,false)),bool_or(r.monitored AND COALESCE((p.data->>'monitored')::boolean,false) AND COALESCE((p.data->>'notify')::boolean,false)) FROM releases r LEFT JOIN release_people rp ON rp.release_id=r.id LEFT JOIN actresses p ON p.id=rp.actress_id AND COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%' GROUP BY r.id`)
+	rows, e := a.db.Query(ctx, `SELECT r.id,r.monitored AND (`+actorAcquireGate+` OR `+listAcquireGate+`),r.monitored AND `+actorNotifyGate+` FROM releases r`)
 	if e != nil {
 		return e
 	}
@@ -299,7 +299,7 @@ func (a *App) automate(ctx context.Context, s Settings, baseline bool) error {
 		if x.kind == "notify" {
 			field = "notify"
 		}
-		e = a.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM release_people rp JOIN actresses p ON p.id=rp.actress_id WHERE rp.release_id=$1 AND COALESCE((p.data->>'monitored')::boolean,false) AND COALESCE((p.data->>$2)::boolean,false) AND COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%')`, r.ID, field).Scan(&gate)
+		e = a.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM release_people rp JOIN actresses p ON p.id=rp.actress_id WHERE rp.release_id=$1 AND COALESCE((p.data->>'monitored')::boolean,false) AND COALESCE((p.data->>$2)::boolean,false) AND COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%') OR ($2='auto_add' AND EXISTS(SELECT 1 FROM release_lists rl JOIN mdblist_lists l ON l.id=rl.list_id WHERE rl.release_id=$1 AND l.enabled AND l.monitored AND l.auto_add))`, r.ID, field).Scan(&gate)
 		if e != nil {
 			return e
 		}

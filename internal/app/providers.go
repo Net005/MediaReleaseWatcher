@@ -69,7 +69,7 @@ func (a *App) fetchRelease(ctx context.Context, s Settings, provider, kind, id s
 		return Release{}, errors.New("metadata identity does not match requested literal ID")
 	}
 	if len(people) == 0 && a.cfg.TMDBAPIKey != "" {
-		people, e = a.tmdbCast(ctx, r)
+		people, e = a.tmdbCast(ctx, &r)
 		if e != nil {
 			a.activity(ctx, "metadata", "Optional TMDb credits fallback failed; no inferred cast", "warning")
 		} else if len(people) > 0 {
@@ -133,9 +133,12 @@ func (a *App) enrichPerson(ctx context.Context, s Settings, p Actress) Actress {
 	// Reject stale/wrong IDs or a different supplied name before attaching any biography.
 	id := first(m, "tmdb", "tmdb_id", "id")
 	name := first(m, "name")
-	if id != p.TMDbID || (name != "" && identityName(name) != identityName(p.Name)) {
+	if id != p.TMDbID || (p.Name != "" && name != "" && identityName(name) != identityName(p.Name)) {
 		p.MetadataStatus = "unavailable: identity mismatch; supplied name and literal ID retained for manual review"
 		return p
+	}
+	if p.Name == "" {
+		p.Name = name
 	}
 	if v := first(m, "profile", "avatar"); v != "" {
 		p.Profile = v
@@ -153,7 +156,7 @@ func (a *App) enrichPerson(ctx context.Context, s Settings, p Actress) Actress {
 	return p
 }
 func (a *App) addActress(w http.ResponseWriter, r *http.Request) {
-	var p Actress
+	p := Actress{Monitored: true}
 	if !readJSON(w, r, &p) {
 		return
 	}
@@ -200,11 +203,18 @@ func (a *App) addActress(w http.ResponseWriter, r *http.Request) {
 func (a *App) importActresses(w http.ResponseWriter, r *http.Request) {
 	var v struct {
 		Entries []struct {
-			Name    string `json:"name"`
-			ActorID string `json:"actor_id"`
-			Group   string `json:"group"`
+			Name      string  `json:"name"`
+			ActorID   string  `json:"actor_id"`
+			Group     *string `json:"group"`
+			Monitored *bool   `json:"monitored"`
+			AutoAdd   *bool   `json:"auto_add"`
+			Notify    *bool   `json:"notify"`
 		} `json:"entries"`
-		Groups map[string]json.RawMessage `json:"groups"`
+		Group     *string                    `json:"group"`
+		Monitored *bool                      `json:"monitored"`
+		AutoAdd   *bool                      `json:"auto_add"`
+		Notify    *bool                      `json:"notify"`
+		Groups    map[string]json.RawMessage `json:"groups"`
 	}
 	if !readJSON(w, r, &v) {
 		return
@@ -230,21 +240,93 @@ func (a *App) importActresses(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(r.Context())
 	added, skipped := 0, 0
+	defaults := Actress{Monitored: true}
+	if v.Group != nil {
+		defaults.Group = *v.Group
+	}
+	if v.Monitored != nil {
+		defaults.Monitored = *v.Monitored
+	}
+	if v.AutoAdd != nil {
+		defaults.AutoAdd = *v.AutoAdd
+	}
+	if v.Notify != nil {
+		defaults.Notify = *v.Notify
+	}
+	seen := map[string]bool{}
 	for _, v := range v.Entries {
-		p := Actress{TMDbID: v.ActorID, Name: v.Name, Group: v.Group, Monitored: true, MetadataStatus: "pending: queued MDBList biography enrichment; no filmography inferred", UpdatedAt: time.Now().UTC()}
-		b, _ := json.Marshal(p)
-		tag, e := tx.Exec(r.Context(), `INSERT INTO actresses(tmdb_id,data) VALUES($1,$2) ON CONFLICT(tmdb_id) DO NOTHING`, p.TMDbID, b)
+		if seen[v.ActorID] {
+			skipped++
+			continue
+		}
+		seen[v.ActorID] = true
+		ctx := r.Context()
+		var before, p Actress
+		var b []byte
+		e = tx.QueryRow(ctx, `SELECT id,data FROM actresses WHERE tmdb_id=$1 FOR UPDATE`, v.ActorID).Scan(&p.ID, &b)
+		if e == nil {
+			id := p.ID
+			if e = json.Unmarshal(b, &p); e != nil {
+				fail(w, 500, "import rolled back")
+				return
+			}
+			p.ID = id
+			before = p
+			skipped++
+		} else if e == pgx.ErrNoRows {
+			p = defaults
+			p.TMDbID = v.ActorID
+			p.Name = v.Name
+			p.MetadataStatus = "pending: queued MDBList biography enrichment; no filmography inferred"
+			p.UpdatedAt = time.Now().UTC()
+			if v.Group != nil {
+				p.Group = *v.Group
+			}
+			if v.Monitored != nil {
+				p.Monitored = *v.Monitored
+			}
+			added++
+		} else {
+			fail(w, 500, "import rolled back")
+			return
+		}
+		if v.AutoAdd != nil {
+			p.AutoAdd = *v.AutoAdd
+		}
+		if v.Notify != nil {
+			p.Notify = *v.Notify
+		}
+		if p.ID == 0 {
+			b, _ = json.Marshal(p)
+			e = tx.QueryRow(ctx, `INSERT INTO actresses(tmdb_id,data) VALUES($1,$2) RETURNING id`, p.TMDbID, b).Scan(&p.ID)
+		} else {
+			updates := map[string]any{}
+			if v.AutoAdd != nil {
+				updates["auto_add"] = *v.AutoAdd
+			}
+			if v.Notify != nil {
+				updates["notify"] = *v.Notify
+			}
+			b, _ = json.Marshal(updates)
+			_, e = tx.Exec(ctx, `UPDATE actresses SET data=data||$2::jsonb,updated_at=now() WHERE id=$1`, p.ID, b)
+		}
 		if e != nil {
 			fail(w, 500, "import rolled back")
 			return
 		}
-		if tag.RowsAffected() == 1 {
-			added++
-		} else {
-			skipped++
+		_, e = tx.Exec(ctx, `INSERT INTO release_people(release_id,actress_id,source) SELECT release_id,$1,source FROM release_cast WHERE tmdb_id=$2 AND $3 NOT LIKE 'unavailable: identity mismatch%' ON CONFLICT DO NOTHING`, p.ID, p.TMDbID, p.MetadataStatus)
+		if e == nil {
+			e = baselineActorActivation(ctx, tx, before, p)
+		}
+		if e != nil {
+			fail(w, 500, "import rolled back")
+			return
 		}
 	}
 	_, e = tx.Exec(r.Context(), `INSERT INTO release_people(release_id,actress_id,source) SELECT rc.release_id,p.id,rc.source FROM release_cast rc JOIN actresses p ON p.tmdb_id=rc.tmdb_id WHERE COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%' ON CONFLICT DO NOTHING`)
+	if e == nil {
+		_, e = tx.Exec(r.Context(), recomputeMonitoring)
+	}
 	if e == nil {
 		e = tx.Commit(r.Context())
 	}
@@ -462,6 +544,8 @@ func (a *App) syncOnce(ctx context.Context) error {
 		return e
 	}
 	candidates := map[int64]Release{}
+	activeList := ""
+	listMembers := map[string][]int64{}
 	failureCount := 0
 	consume := func(raw json.RawMessage, kind string) error {
 		r, people, e := normalizeRelease(raw, kind)
@@ -480,6 +564,9 @@ func (a *App) syncOnce(ctx context.Context) error {
 			}
 		}
 		candidates[r.ID] = r
+		if activeList != "" {
+			listMembers[activeList] = append(listMembers[activeList], r.ID)
+		}
 		return nil
 	}
 	pageFeed := func(path string, offsetMode bool, q url.Values) error {
@@ -533,11 +620,32 @@ func (a *App) syncOnce(ctx context.Context) error {
 		return errors.New("metadata pagination safety limit reached")
 	}
 	a.stage(ctx, "Loading configured MDBList lists (source membership is not a cast match)")
-	for _, id := range listIDs(s.MDBList.ListIDs) {
-		if e = pageFeed("/lists/"+id+"/items", false, url.Values{"limit": {"1000"}, "append_to_response": {"poster,description,genres,ratings"}}); e != nil {
+	// Legacy encrypted settings may not have persisted policy rows yet.
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	if err = syncListPolicies(ctx, tx, s); err == nil {
+		err = tx.Commit(ctx)
+	} else {
+		_ = tx.Rollback(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	for _, list := range configuredLists(s.MDBList) {
+		if !list.Enabled {
+			continue
+		}
+		activeList = list.ID
+		if e = pageFeed("/lists/"+list.ID+"/items", false, url.Values{"limit": {"1000"}, "append_to_response": {"poster,description,genres,ratings"}}); e != nil {
+			return e
+		}
+		if e = a.replaceListMembership(ctx, list.ID, listMembers[list.ID]); e != nil {
 			return e
 		}
 	}
+	activeList = ""
 	a.stage(ctx, "Loading favorites-upcoming and explicit matched-person relationships")
 	if e = pageFeed("/people/favorites/upcoming", true, url.Values{"limit": {"100"}}); e != nil {
 		return e
@@ -603,7 +711,7 @@ func (a *App) syncOnce(ctx context.Context) error {
 				returned[r.TMDbID] = true
 				source := "mdblist:cast"
 				if len(people) == 0 && a.cfg.TMDBAPIKey != "" {
-					people, e = a.tmdbCast(ctx, r)
+					people, e = a.tmdbCast(ctx, &r)
 					if e != nil {
 						failureCount++
 					} else if len(people) > 0 {
@@ -645,6 +753,13 @@ func (a *App) syncOnce(ctx context.Context) error {
 		// Discovery IDs were fully persisted; omissions here are optional per-title
 		// enrichment gaps, not incomplete source pagination. Baseline all known IDs
 		// silently so permanently unavailable metadata cannot block the whole app.
+	}
+	a.stage(ctx, "Refreshing configured Sonarr/Radarr inventories (read-only)")
+	if err := a.syncArr(ctx); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		a.activity(ctx, "arr", "Read-only inventory sync incomplete; prior availability retained: "+providerError(err), "warning")
 	}
 	a.stage(ctx, "Evaluating explicitly opted-in automation (initial baseline always silent)")
 	// Discovery may take hours. Re-read global consent/config after network work.

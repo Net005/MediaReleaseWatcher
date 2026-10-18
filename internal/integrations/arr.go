@@ -84,6 +84,15 @@ type arrItem struct {
 	Tags                []int       `json:"tags"`
 	MinimumAvailability string      `json:"minimumAvailability"`
 	Seasons             []arrSeason `json:"seasons"`
+	HasFile             bool        `json:"hasFile"`
+	MovieFile           struct {
+		ID   int   `json:"id"`
+		Size int64 `json:"size"`
+	} `json:"movieFile"`
+	Statistics struct {
+		EpisodeFileCount int  `json:"episodeFileCount"`
+		EpisodeCount     *int `json:"episodeCount"`
+	} `json:"statistics"`
 }
 
 func itemFromMap(m map[string]any) arrItem {
@@ -190,29 +199,23 @@ func (c *Client) Add(ctx context.Context, kind string, media Media, options AddO
 	if err := validateSelections(selections, options); err != nil {
 		return zero, err
 	}
-	var existing []arrItem
-	if err := c.arrRequest(ctx, s, http.MethodGet, s.resource, nil, nil, &existing); err != nil {
+	inventory, err := c.ArrInventory(ctx, kind)
+	if err != nil {
 		return zero, err
 	}
-	for _, item := range existing {
-		matches := sameMedia(item, media, kind)
-		sharedIdentity := (kind == "radarr" && media.TMDbID > 0 && item.TMDbID == media.TMDbID) || (kind == "sonarr" && media.TVDbID > 0 && item.TVDbID == media.TVDbID) || (media.IMDbID != "" && item.IMDbID == media.IMDbID)
-		if sharedIdentity && !matches {
-			return zero, errors.New("existing acquisition record has conflicting provider identities")
+	presence, err := inventory.Match(media)
+	if err != nil {
+		return zero, err
+	}
+	if presence.ID > 0 {
+		verified, err := c.readArr(ctx, s, presence.ID)
+		if err != nil {
+			return zero, fmt.Errorf("%s existing-item readback failed: %w", kind, err)
 		}
-		if matches {
-			if item.ID <= 0 {
-				return zero, errors.New("existing acquisition record has an invalid ID")
-			}
-			verified, err := c.readArr(ctx, s, item.ID)
-			if err != nil {
-				return zero, fmt.Errorf("%s existing-item readback failed: %w", kind, err)
-			}
-			if verified.ID != item.ID || !sameMedia(verified, media, kind) {
-				return zero, errors.New("existing acquisition record failed identity verification")
-			}
-			return c.arrResult(s, verified, true), nil
+		if verified.ID != presence.ID || !sameMedia(verified, media, kind) {
+			return zero, errors.New("existing acquisition record failed identity verification")
 		}
+		return c.arrResult(s, verified, true), nil
 	}
 	term := "imdb:" + media.IMDbID
 	if kind == "radarr" && media.TMDbID > 0 {
@@ -229,10 +232,16 @@ func (c *Client) Add(ctx context.Context, kind string, media Media, options AddO
 	var found arrItem
 	for _, candidate := range candidates {
 		item := itemFromMap(candidate)
+		shared := kind == "radarr" && media.TMDbID > 0 && item.TMDbID == media.TMDbID || kind == "sonarr" && media.TVDbID > 0 && item.TVDbID == media.TVDbID || media.IMDbID != "" && item.IMDbID == media.IMDbID
+		if shared && !sameMedia(item, media, kind) {
+			return zero, errors.New("acquisition lookup has conflicting provider identities")
+		}
 		if sameMedia(item, media, kind) {
+			if metadata != nil {
+				return zero, errors.New("acquisition lookup match is ambiguous")
+			}
 			metadata = candidate
 			found = item
-			break
 		}
 	}
 	if metadata == nil {
@@ -350,10 +359,11 @@ func (c *Client) arrResult(s arrService, item arrItem, exists bool) AddResult {
 	// Internal item IDs are always safe for API readback. The UI uses the lookup
 	// slug; never forward an arbitrary URL returned by the remote API.
 	slug := item.TitleSlug
-	if slug == "" {
+	if !safeSiloID(slug) {
 		slug = strconv.Itoa(item.ID)
 	}
-	path := "/" + s.resource + "/" + url.PathEscape(slug)
+	// endpoint encodes Path exactly once; pre-escaping here corrupts Unicode slugs.
+	path := "/" + s.resource + "/" + slug
 	target, _ := endpoint(s.base, path, nil)
 	return AddResult{ID: item.ID, AlreadyExists: exists, URL: target}
 }

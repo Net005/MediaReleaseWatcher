@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise an isolated, NEW app/database. Never run against an existing install."""
 import argparse
+from datetime import date, timedelta
 import http.cookiejar
 import json
 import secrets
@@ -40,15 +41,41 @@ def main():
     for path in ['/api/dashboard', '/api/releases', '/api/actresses', '/api/activity']:
         call('GET', path)
     settings = call('GET', '/api/settings')
-    for section in ['mdblist', 'sonarr', 'radarr', 'pushover']:
+    for section in ['mdblist', 'sonarr', 'radarr', 'silo', 'pushover']:
         for field in ['api_key', 'token', 'user']:
             assert not settings.get(section, {}).get(field), 'Secret leaked through settings API'
     assert not settings.get('automation', {}).get('enabled', False)
-    call('POST', '/api/actresses/import', {'entries': [
-        {'name': 'Synthetic smoke fixture', 'actor_id': '999999999999', 'group': 'Smoke test'}
-    ]}, expected=(200, 201, 202))
+    call('GET', '/api/mdblist/lists')
+    tasks = call('GET', '/api/tasks')['items']
+    assert len(tasks) == 1 and tasks[0]['type'] == 'catalog_sync'
+    task = call('POST', '/api/tasks', {
+        'type': 'arr_sync', 'name': 'Synthetic paused inventory task', 'enabled': False,
+        'frequency': 'once', 'date': (date.today() + timedelta(days=7)).isoformat(), 'time': '08:30',
+        'timezone': 'Europe/Amsterdam', 'interval_minutes': 0, 'weekdays': [],
+        'allow_download_search': False
+    }, expected=(201,))
+    tid = str(task['id'])
+    assert task['enabled'] is False and task['timezone'] == 'Europe/Amsterdam'
+    call('PATCH', '/api/tasks/' + tid, {'name': 'Edited paused inventory task'})
+    task = next(item for item in call('GET', '/api/tasks')['items'] if str(item['id']) == tid)
+    assert task['name'] == 'Edited paused inventory task' and task['enabled'] is False
+    call('DELETE', '/api/tasks/' + tid, expected=(200, 204))
+    assert all(str(item['id']) != tid for item in call('GET', '/api/tasks')['items'])
+    source_entry = {'name': 'Synthetic smoke fixture', 'actor_id': '999999999999', 'group': 'Smoke test'}
+    call('POST', '/api/actresses/import', {
+        'group': 'Fallback smoke group', 'monitored': False, 'auto_add': True, 'notify': True,
+        'entries': [source_entry, source_entry]
+    }, expected=(200, 201, 202))
     actresses = call('GET', '/api/actresses')['items']
     actress = next(a for a in actresses if a['tmdb_id'] == '999999999999')
+    assert sum(a['tmdb_id'] == '999999999999' for a in actresses) == 1
+    assert actress['group'] == 'Smoke test' and actress['monitored'] is False
+    assert actress['auto_add'] is True and actress['notify'] is True
+    assert not call('GET', '/api/actresses?upcoming_only=true')['items']
+    call('POST', '/api/actresses/import', {'entries': [source_entry], 'monitored': True,
+         'auto_add': False, 'notify': False}, expected=(200, 201, 202))
+    reread = next(a for a in call('GET', '/api/actresses')['items'] if a['tmdb_id'] == '999999999999')
+    assert reread['monitored'] is False and reread['auto_add'] is True and reread['notify'] is True
     aid = str(actress['id'])
     detail = call('GET', '/api/actresses/' + aid)
     assert detail['actress']['name'] == 'Synthetic smoke fixture'
@@ -62,7 +89,7 @@ def main():
     assert not call('GET', '/api/session')['authenticated']
     call('POST', '/api/login', {'password': password})
     assert call('GET', '/api/session')['authenticated']
-    print('PASS: database readiness, setup/auth, catalogue APIs, safe settings, actress import/detail/edit/delete and persistent login.')
+    print('PASS: database readiness, setup/auth, catalogue APIs, redacted settings, IANA schedule CRUD, actress import defaults/deduplication/opt-out preservation/upcoming filter, actress CRUD and persistent login.')
 
 
 if __name__ == '__main__':

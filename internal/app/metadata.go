@@ -5,6 +5,8 @@ import "encoding/json"
 // Sparse discovery and supplemental credits must never erase richer metadata.
 // Collection absence/empty means unavailable, not an authoritative deletion.
 func mergeRelease(old, in Release) Release {
+	// Availability belongs to verified local checks, never provider metadata.
+	in.LocalAvailability = old.LocalAvailability
 	if in.Title == "" {
 		in.Title = old.Title
 	}
@@ -61,6 +63,9 @@ func mergeRelease(old, in Release) Release {
 	}
 	if len(in.Genres) == 0 {
 		in.Genres = old.Genres
+	}
+	if len(in.Cast) == 0 {
+		in.Cast = old.Cast
 	}
 	if len(in.Ratings) == 0 {
 		in.Ratings = old.Ratings

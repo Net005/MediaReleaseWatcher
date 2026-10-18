@@ -10,7 +10,7 @@ import (
 )
 
 // Optional missing-cast fallback only. MDBList remains the title metadata provider.
-func (a *App) tmdbCast(ctx context.Context, r Release) ([]string, error) {
+func (a *App) tmdbCast(ctx context.Context, r *Release) ([]string, error) {
 	if a.cfg.TMDBAPIKey == "" || r.TMDbID == "" {
 		return nil, nil
 	}
@@ -45,5 +45,6 @@ func (a *App) tmdbCast(ctx context.Context, r Release) ([]string, error) {
 	if e != nil {
 		return nil, e
 	}
+	r.Cast = castDetails(m)
 	return castIDs(m), nil
 }

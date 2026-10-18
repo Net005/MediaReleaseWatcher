@@ -12,4 +12,29 @@
 .details-block{border-bottom:1px solid var(--line);padding:12px 0}
 .details-block summary{cursor:pointer;font-size:12px;color:var(--muted)}
 .details-block[open] summary{color:var(--text);margin-bottom:12px}
+/* Controlled discovery, source evidence, and independent schedules. */
+.release-provenance{display:grid;gap:4px;margin:10px 0;font-size:11px;color:var(--muted);overflow-wrap:anywhere}
+.release-provenance>span{color:var(--text)}
+.arr-presence,.local-availability{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin:9px 0;font-size:11px}
+.arr-presence .badge,.local-availability .badge{white-space:normal;overflow-wrap:anywhere}
+.arr-presence a,.local-availability a{color:var(--teal);text-decoration:underline;text-underline-offset:3px}
+.arr-presence small{flex-basis:100%;overflow-wrap:anywhere}
+.list-policy-row,.import-defaults,[data-task-weekdays]{border:1px solid var(--line);border-radius:8px;padding:15px;margin:16px 0;min-inline-size:0}
+.list-policy-row legend,.import-defaults legend,[data-task-weekdays] legend{font-size:12px;color:var(--muted);padding:0 6px}
+.list-policy-row .actions{margin-top:12px}
+.watchlist-panel,.cast-panel{margin-top:22px}
+.watchlist-panel .actions{margin-top:12px}
+.cast-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:12px;margin:16px 0}
+.cast-card{display:flex;flex-direction:column;align-items:stretch;gap:5px;text-align:left;overflow:hidden;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px;min-width:0}
+.cast-card .art{aspect-ratio:2/3;width:100%;border-radius:5px}
+.cast-card b{font-size:12px;overflow-wrap:anywhere}
+.cast-card small{font-size:11px;color:var(--muted);overflow-wrap:anywhere}
+.task-settings{grid-column:2;min-width:0}
+.task-row{border:1px solid var(--line);border-radius:8px;padding:17px;margin-top:15px;overflow-wrap:anywhere}
+.task-row h3{font-size:15px;margin:0}
+.task-row>p{font-size:12px;color:var(--muted)}
+.task-row .detail-facts{margin:12px 0}
+#task-form>.check,#task-form>[data-task-search]{margin-top:15px}
+@media(max-width:960px){.task-settings{grid-column:1}.cast-grid{grid-template-columns:repeat(auto-fill,minmax(100px,1fr))}}
+@media(max-width:600px){.task-row{padding:12px}.task-row .actions{gap:6px}.toolbar>.check{width:100%;padding:4px 0}.cast-grid{gap:8px}}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*:before,*:after{animation:none!important;transition:none!important}.spinner{border-color:var(--accent);border-style:dotted}.progress-track.running:before{transform:translateX(100%)}}

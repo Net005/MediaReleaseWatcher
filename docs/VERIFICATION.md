@@ -2,7 +2,26 @@
 
 Local verification on 2026-10-18. This records exercised behavior, not a claim of complete provider coverage.
 
-## Executed successfully
+## Controlled-discovery upgrade: local automated verification
+
+The upgrade was exercised against disposable databases and synthetic external providers, separately from the original delivery below:
+
+| Check | Result |
+| --- | --- |
+| Full Go race suite with real PostgreSQL | 469 passing tests/subtests; zero test failures or skipped tests |
+| Static analysis and native build | `go vet ./...` and `go build -trimpath` passed |
+| Frontend unit and Chromium handler checks | 42 passed |
+| Parent Playwright browser workflows | 8 passed, including upcoming-only filtering and import controls |
+| Fresh-install API smoke | Authentication, redaction, IANA-zone schedule CRUD, import defaults/duplicates/opt-out preservation, upcoming filter and actress CRUD passed |
+| Actual startup migration regression | One-time release reset preserves account/session/settings/watches; later startup preserves new releases |
+| Failed startup regression | Wrong encryption key does not clear the catalogue or commit the reset marker |
+| Schedule startup regression | Seeds one initial task; preserves disabled/edited schedules without duplication |
+| Private data isolation | Prepared import payload is ignored, Docker-excluded and mode 0600; real configured secrets absent from staged source |
+| Independent review | Core/UI, integration/scheduler safety fixes, and final Silo identity-coverage patch approved with no remaining blockers |
+
+The main command package has no tests. Independent review, remote CI/image publication and verification of the running deployment are distinct gates; local passes alone do not establish any of them. No real watchlist mutation, manager acquisition/search or notification was performed during validation.
+
+## Original delivery: executed successfully
 
 | Check | Result |
 | --- | --- |

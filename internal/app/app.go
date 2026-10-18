@@ -8,6 +8,7 @@ import (
 	"errors"
 	"github.com/jackc/pgx/v5"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -70,7 +71,28 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		db.Close()
 		return nil, errors.New("database unavailable")
 	}
-	b, e := migrations.ReadFile("migrations/001_initial.sql")
+	if cfg.DataDir == "" {
+		cfg.DataDir = "data"
+	}
+	if e = os.MkdirAll(cfg.DataDir+"/artwork", 0700); e != nil {
+		db.Close()
+		return nil, e
+	}
+	// Validate existing encrypted settings before any destructive upgrade. A bad
+	// APP_SECRET must fail without clearing the release catalogue or reset marker.
+	var hasSettings bool
+	if e = db.QueryRow(ctx, `SELECT to_regclass('public.settings') IS NOT NULL`).Scan(&hasSettings); e != nil {
+		db.Close()
+		return nil, e
+	}
+	if hasSettings {
+		preflight := &App{db: db, cipher: c, cfg: cfg}
+		if _, e = preflight.settings(ctx); e != nil {
+			db.Close()
+			return nil, e
+		}
+	}
+	migrationFiles, e := migrations.ReadDir("migrations")
 	if e == nil {
 		tx, x := db.Begin(ctx)
 		if x != nil {
@@ -79,7 +101,19 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 			defer tx.Rollback(ctx)
 			_, e = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(486722119)`)
 			if e == nil {
-				_, e = tx.Exec(ctx, string(b))
+				for _, file := range migrationFiles {
+					if file.IsDir() || !strings.HasSuffix(file.Name(), ".sql") {
+						continue
+					}
+					var migration []byte
+					migration, e = migrations.ReadFile("migrations/" + file.Name())
+					if e == nil {
+						_, e = tx.Exec(ctx, string(migration))
+					}
+					if e != nil {
+						break
+					}
+				}
 			}
 			if e == nil {
 				e = tx.Commit(ctx)
@@ -87,13 +121,6 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		}
 	}
 	if e != nil {
-		db.Close()
-		return nil, e
-	}
-	if cfg.DataDir == "" {
-		cfg.DataDir = "data"
-	}
-	if e = os.MkdirAll(cfg.DataDir+"/artwork", 0700); e != nil {
 		db.Close()
 		return nil, e
 	}
@@ -118,6 +145,10 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 		a.Close()
 		return nil, e
 	}
+	if e = a.ensureSchedules(ctx); e != nil {
+		a.Close()
+		return nil, e
+	}
 	return a, nil
 }
 func (a *App) Close() { a.mu.Lock(); a.cancel(); a.mu.Unlock(); a.wg.Wait(); a.db.Close() }
@@ -125,6 +156,7 @@ func (a *App) Start() {
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		a.runDueSchedules(a.ctx)
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
 		for {
@@ -132,17 +164,7 @@ func (a *App) Start() {
 			case <-a.ctx.Done():
 				return
 			case <-ticker.C:
-				s, e := a.settings(a.ctx)
-				if e != nil || s.MDBList.APIKey == "" {
-					continue
-				}
-				a.mu.Lock()
-				last := a.syncState.LastRun
-				running := a.syncState.Running
-				a.mu.Unlock()
-				if !running && (last == nil || time.Since(*last) >= time.Duration(s.MDBList.SyncIntervalMinutes)*time.Minute) {
-					a.startSync()
-				}
+				a.runDueSchedules(a.ctx)
 			}
 		}
 	}()

@@ -9,11 +9,25 @@ import (
 	"strings"
 )
 
+type SiloSettings struct {
+	URL        string `json:"url"`
+	Configured bool   `json:"configured"`
+	APIKey     string `json:"api_key,omitempty"`
+	Enabled    bool   `json:"enabled"`
+}
+type MDBListPolicy struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Enabled   bool   `json:"enabled"`
+	Monitored bool   `json:"monitored"`
+	AutoAdd   bool   `json:"auto_add"`
+}
 type MDBSettings struct {
-	Configured          bool   `json:"configured"`
-	APIKey              string `json:"api_key,omitempty"`
-	ListIDs             string `json:"list_ids"`
-	SyncIntervalMinutes int    `json:"sync_interval_minutes"`
+	Lists               []MDBListPolicy `json:"lists"`
+	Configured          bool            `json:"configured"`
+	APIKey              string          `json:"api_key,omitempty"`
+	ListIDs             string          `json:"list_ids"`
+	SyncIntervalMinutes int             `json:"sync_interval_minutes"`
 }
 type ArrSettings struct {
 	URL              string `json:"url"`
@@ -36,6 +50,7 @@ type AutomationSettings struct {
 	NotifyFirstSync bool `json:"notify_first_sync"`
 }
 type Settings struct {
+	Silo       SiloSettings       `json:"silo"`
 	MDBList    MDBSettings        `json:"mdblist"`
 	Sonarr     ArrSettings        `json:"sonarr"`
 	Radarr     ArrSettings        `json:"radarr"`
@@ -46,6 +61,9 @@ type Settings struct {
 
 func defaultSettings() Settings { return Settings{MDBList: MDBSettings{SyncIntervalMinutes: 360}} }
 func (s Settings) public() Settings {
+	s.Silo.Configured = s.Silo.URL != "" && s.Silo.APIKey != ""
+	s.Silo.APIKey = ""
+	s.MDBList.Lists = configuredLists(s.MDBList)
 	s.Automation.NotifyFirstSync = false // Retained compatibility field; baseline notifications are unsupported.
 	s.MDBList.Configured = s.MDBList.APIKey != ""
 	s.Sonarr.Configured = s.Sonarr.APIKey != "" && s.Sonarr.URL != ""
@@ -75,9 +93,11 @@ func (a *App) settings(ctx context.Context) (Settings, error) {
 		return s, errors.New("cannot decrypt settings: check APP_SECRET")
 	}
 	e = json.Unmarshal(b, &s)
+	s.MDBList.Lists = configuredLists(s.MDBList)
 	return s, e
 }
 func (a *App) saveSettings(ctx context.Context, s Settings) error {
+	s.MDBList.Lists = configuredLists(s.MDBList)
 	b, e := json.Marshal(s)
 	if e != nil {
 		return e
@@ -86,8 +106,18 @@ func (a *App) saveSettings(ctx context.Context, s Settings) error {
 	if e != nil {
 		return e
 	}
-	_, e = a.db.Exec(ctx, `INSERT INTO settings(id,encrypted) VALUES(1,$1) ON CONFLICT(id) DO UPDATE SET encrypted=excluded.encrypted,updated_at=now()`, b)
-	return e
+	tx, e := a.db.Begin(ctx)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback(ctx)
+	if e = syncListPolicies(ctx, tx, s); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(ctx, `INSERT INTO settings(id,encrypted) VALUES(1,$1) ON CONFLICT(id) DO UPDATE SET encrypted=excluded.encrypted,updated_at=now()`, b); e != nil {
+		return e
+	}
+	return tx.Commit(ctx)
 }
 func validPublicURL(raw string) error {
 	if raw == "" {
@@ -114,7 +144,14 @@ func validSettings(s Settings) error {
 			return errors.New("list_ids must contain literal positive numeric IDs")
 		}
 	}
-	for _, x := range []string{s.Sonarr.URL, s.Radarr.URL, s.PublicURL} {
+	seen := map[string]bool{}
+	for _, list := range configuredLists(s.MDBList) {
+		if !numericID.MatchString(list.ID) || seen[list.ID] || len(list.Name) > 300 {
+			return errors.New("lists require unique literal positive numeric IDs and names up to 300 bytes")
+		}
+		seen[list.ID] = true
+	}
+	for _, x := range []string{s.Sonarr.URL, s.Radarr.URL, s.Silo.URL, s.PublicURL} {
 		if x == "" {
 			continue
 		}

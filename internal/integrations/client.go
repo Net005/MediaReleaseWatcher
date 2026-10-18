@@ -17,7 +17,7 @@ import (
 )
 
 // Config contains server-side credentials. Never serialize it into API responses.
-type Config struct{ MDBListAPIKey, MDBListBaseURL, SonarrURL, SonarrAPIKey, RadarrURL, RadarrAPIKey, PushoverToken, PushoverUser, PushoverURL string }
+type Config struct{ MDBListAPIKey, MDBListBaseURL, SonarrURL, SonarrAPIKey, RadarrURL, RadarrAPIKey, PushoverToken, PushoverUser, PushoverURL, SiloURL, SiloAPIKey string }
 type Options struct {
 	RootFolders     []RootFolder     `json:"root_folders"`
 	QualityProfiles []QualityProfile `json:"quality_profiles"`
@@ -80,6 +80,8 @@ type Client struct {
 	mu            sync.Mutex
 	cooldown      map[string]time.Time
 	addMu         sync.Mutex
+	siloMu        sync.Mutex
+	siloCache     *siloSnapshot
 	tvmazeBaseURL string
 	tvmazeGate    *requestGate
 }
@@ -110,6 +112,10 @@ func endpoint(base, path string, q url.Values) (string, error) {
 }
 
 func (c *Client) request(ctx context.Context, service, method, target, key, contentType string, body []byte) (json.RawMessage, error) {
+	return c.requestHeaders(ctx, service, method, target, key, contentType, body, nil)
+}
+
+func (c *Client) requestHeaders(ctx context.Context, service, method, target, key, contentType string, body []byte, headers http.Header) (json.RawMessage, error) {
 	if len(body) > maxRequestBytes {
 		return nil, errors.New("integration request exceeds size limit")
 	}
@@ -132,6 +138,9 @@ func (c *Client) request(ctx context.Context, service, method, target, key, cont
 	}
 	if key != "" {
 		req.Header.Set("X-Api-Key", key)
+	}
+	for name, values := range headers {
+		req.Header[name] = values
 	}
 	res, err := c.http.Do(req)
 	if err != nil {

@@ -2,20 +2,39 @@
 
 An MDBList-first, self-hosted release desk for the people and titles you follow.
 
-**Go · PostgreSQL · Docker Compose · Sonarr · Radarr · Pushover**
+**Go · PostgreSQL · Docker Compose · Sonarr · Radarr · Silo · Pushover**
 
 Browse past, current and upcoming movies and series in a cinematic, cover-first web interface. Follow actresses, inspect their biographies and genuinely matched releases, and send individual titles—or a confirmed batch—to your media managers.
 
 ## Features
 
 - Responsive dark catalogue, real cover art, featured releases, date windows, search, groups and release calendar.
-- Actress portrait cards, profiles, monitoring preferences and a detail view of all currently matched titles.
+- Actress portrait cards, clickable source-linked cast/person details, upcoming-only filtering and a detail view of genuinely matched titles.
+- Bulk actress import with the same group, monitor, automatic-add and notification controls as single-add, with exact-ID deduplication and per-entry overrides.
+- Per-personal-MDBList filters and independent monitoring/automatic-add policies. General discovery is unmonitored by default; explicit manual opt-out always wins.
+- Infinite release scrolling with deduplication, stale-request cancellation, retry and an accessible load-more fallback.
+- Explicit MDBList watchlist add/remove on release details, with remote-state readback rather than optimistic success.
+- Read-only Sonarr/Radarr library reconciliation and simple exact-ID In Silo badges with item links.
+- Persistent once/interval/daily/weekly schedules, IANA time zones, run-now, enable/disable and next/last-run results.
 - MDBList catalogue/list discovery, biographies, ratings, certifications, age guidance, parental-content indicators, release dates, providers and artwork.
 - Movie quick-add to Radarr and series quick-add to Sonarr, with profile/root-folder selection, existing-item checks and exact readback verification.
 - Per-actress bulk add with item-by-item success, existing, skipped and failure results.
 - Opt-in automatic acquisition and Pushover alerts with a cover attachment and release information. Background actions are disabled initially; baseline imports do not send historic notification floods.
 - Persistent PostgreSQL state, encrypted integration secrets, single-user password authentication and a cached artwork proxy.
 - Activity/progress reporting and configurable background synchronization, without an LLM in the data pipeline.
+
+## Upgrading from the original discovery release
+
+**This upgrade clears the old release catalogue once, using guarded migration 3.** Administrator login, sessions, encrypted integration settings/API keys and actress watches are preserved. Later restarts and upgrades preserve newly collected releases; this is not a recurring reset. Keep the original `.env` and `APP_SECRET`. An invalid encryption key now stops startup before the catalogue reset can run.
+
+Back up the database and `.env`, then update only the app:
+
+```sh
+docker compose pull app
+docker compose up -d app
+```
+
+Run **Sync now** to repopulate the catalogue and inspect Activity. Review the independent per-list opt-ins before enabling automation. Existing library recognition never sends an add or search command. Do not restore the old catalogue over the upgraded policy tables without an intentional rollback plan, and do not delete the database volume.
 
 ## Quick start: published container
 
@@ -51,7 +70,7 @@ Compose binds the web UI to **127.0.0.1** by default and does not publish Postgr
 ## Configure your sources
 
 1. Save your MDBList API key in Settings (or supply `MDBLIST_API_KEY` through `.env`). Existing blank secret inputs mean **keep the saved value**, not erase it.
-2. Enter numeric MDBList list IDs to watch. Movie and show lists are separate sources; all pages are collected. No personal lists or private roster are shipped with the repository.
+2. Select personal MDBList sources or enter numeric list IDs. Each has independent Enabled, Monitor and Auto-add controls; Monitor and Auto-add start off. Movie and show lists are separate sources; all pages are collected. No personal lists or private roster are shipped with the repository.
 3. Add actresses using a literal TMDb person ID and known source name, or import a JSON watch list. Group names are user-defined and not inferred from ethnicity.
 4. Run synchronization and inspect Activity for coverage and any provider limitations.
 
@@ -59,13 +78,17 @@ Import shape:
 
 ```json
 {
+  "group": "Default group",
+  "monitored": true,
+  "auto_add": false,
+  "notify": false,
   "entries": [
     {"name": "Example performer", "actor_id": "123456789", "group": "My group"}
   ]
 }
 ```
 
-This is a **synthetic format example**, not a real performer record. Source IDs are preserved rather than silently repaired. Missing provider records remain explicit warnings.
+This is a **synthetic format example**, not a real performer record. Top-level fields are defaults for new entries; explicit entry flags and source groups take precedence. Ordinary defaults do not replace existing watch preferences. Explicit per-entry preference updates can apply to an existing exact ID without creating another watch. Source IDs are preserved rather than silently repaired. Missing provider records remain explicit warnings.
 
 ### MDBList first; supplements only when needed
 
@@ -81,8 +104,16 @@ Configure each service's base URL, API key, quality profile and root folder in S
 
 - **Movies → Radarr. Series → Sonarr.** The app rejects incompatible targets.
 - Quick-add and bulk-add are explicit web actions. Search-on-add is an explicit option; an add is not proof that a download completed.
-- Automatic acquisition additionally requires its global and per-actress switches plus a configured/enabled destination.
+- Automatic acquisition additionally requires a monitored title, an explicit per-list or per-actress automatic-add rule, the global switch, and a configured/enabled destination.
 - Existing items are checked before adding. A new add is read back from the exact remote ID before success is recorded. Uncertain or partial results remain visible.
+
+## Local availability and schedules
+
+Configure Silo in Settings and use **Test** / **Sync Silo**. A unique, type-consistent TMDb, IMDb or TVDb ID match shows **In Silo** with a link to that item. This checks library membership, not playback health; no file probes or playback sessions are started. Ambiguous matches and failed/incomplete lookups remain unknown/error, never a false absence. Sonarr/Radarr membership is displayed separately.
+
+The Tasks section supports catalogue refresh, Silo availability, Arr library reconciliation and explicitly permitted missing-release searches. Schedules persist across restarts, including disabled jobs and edits. IANA zones and local dates/times are validated; nonexistent DST times are not silently shifted. Download searches require the task's explicit permission, global automation, enabled compatible integration and that integration's search opt-in. Searches target only exact manager IDs corresponding to app-monitored releases, never an entire manager library.
+
+Watchlist controls are independent of these tasks: background discovery never adds to or removes from your MDBList watchlist.
 
 ## Pushover
 

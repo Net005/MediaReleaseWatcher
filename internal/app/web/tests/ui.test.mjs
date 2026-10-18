@@ -46,6 +46,13 @@ test('settings blank secrets are omitted; explicit toggles and numeric profiles 
   assert.equal(result.automation.enabled, false);
   assert.equal('configured' in result.sonarr, false);
 });
+test('list policies round-trip independent opt-ins and compare array values rather than references',()=>{
+  const result=buildSettingsPayload(new Map([['mdblist.list_count','2'],['mdblist.lists.0.id','0012'],['mdblist.lists.0.name','My list'],['mdblist.lists.0.enabled','on'],['mdblist.lists.1.id','34'],['mdblist.lists.1.name','Another list'],['mdblist.lists.1.monitored','on'],['mdblist.lists.1.auto_add','on']]));
+  assert.deepEqual(result.mdblist.lists,[{id:'0012',name:'My list',enabled:true,monitored:false,auto_add:false},{id:'34',name:'Another list',enabled:false,monitored:true,auto_add:true}]);
+  assert.equal(settingsMatch(structuredClone(result),result),true);
+  const changed=structuredClone(result);changed.mdblist.lists[0].monitored=true;assert.equal(settingsMatch(changed,result),false);
+});
+
 test('initial baseline notifications remain disabled even with a stale form toggle', () => {
   const result=buildSettingsPayload(new Map([['automation.notify_first_sync','on']]));
   assert.equal(result.automation.notify_first_sync,false);
@@ -54,6 +61,14 @@ test('initial baseline notifications remain disabled even with a stale form togg
 test('search rows map real provider IDs and never treat a local id as a TMDb id', () => {
   assert.deepEqual(normalizeSearchRow({title:'Film',mediatype:'movie',imdbid:'tt123',tmdbid:45}), {title:'Film', type:'movie', provider:'imdb', id:'tt123', year:null, poster:''});
   assert.equal(normalizeSearchRow({id:18,title:'Unknown',type:'movie'}).id, null);
+});
+
+test('search rows use supplied nested provider identities without guessing from generic IDs',()=>{
+  assert.deepEqual(normalizeSearchRow({title:'Nested title',type:'movie',ids:{imdb:'tt7654321',tmdb:654321}}),{title:'Nested title',type:'movie',provider:'imdb',id:'tt7654321',year:null,poster:''});
+  assert.equal(normalizeSearchRow({name:'Series',media_type:'tv',ids:{tmdb:'00042'}}).id,'00042');
+  assert.equal(normalizeSearchRow({type:'movie',id:123,ids:{trakt:123,mdblist:123}}).id,null);
+  assert.equal(normalizeSearchRow({type:'movie',ids:{tmdb:9007199254740992}}).id,null);
+  assert.equal(normalizeSearchRow({type:'movie',ids:{imdb:'bad',tmdb:'42'}}).id,'42');
 });
 
 test('settings readback compares explicit nonsecret values and tolerates credential redaction',()=>{

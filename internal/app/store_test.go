@@ -19,7 +19,7 @@ func testApp(t *testing.T) *App {
 		t.Fatal(e)
 	}
 	t.Cleanup(a.Close)
-	_, e = a.db.Exec(context.Background(), `TRUNCATE release_people, releases, actresses, activity, actions, sessions, account, settings, app_state RESTART IDENTITY CASCADE`)
+	_, e = a.db.Exec(context.Background(), `TRUNCATE release_people, releases, actresses, activity, actions, sessions, account, settings, app_state, mdblist_lists, scheduled_tasks RESTART IDENTITY CASCADE`)
 	if e != nil {
 		t.Fatal(e)
 	}

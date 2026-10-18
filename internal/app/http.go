@@ -103,8 +103,11 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /api/settings", a.getSettings)
 	mux.HandleFunc("PUT /api/settings", a.putSettings)
 	mux.HandleFunc("GET /api/releases", a.listReleases)
+	mux.HandleFunc("GET /api/mdblist/lists", a.listMDBLists)
 	mux.HandleFunc("POST /api/releases", a.addRelease)
 	mux.HandleFunc("GET /api/releases/{id}", a.releaseDetail)
+	mux.HandleFunc("GET /api/releases/{id}/cast", a.releaseCast)
+	mux.HandleFunc("GET /api/people/{id}", a.personDetail)
 	mux.HandleFunc("PATCH /api/releases/{id}", a.patchRelease)
 	mux.HandleFunc("GET /api/actresses", a.listActresses)
 	mux.HandleFunc("POST /api/actresses", a.addActress)
@@ -138,6 +141,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /api/releases/{id}/acquire", a.acquireRelease)
 	mux.HandleFunc("POST /api/actresses/{id}/acquire", a.acquireActress)
 	mux.HandleFunc("GET /api/artwork", a.artwork)
+	a.registerUpgradeRoutes(mux)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			fail(w, 404, "API route not found")
@@ -330,6 +334,9 @@ func (a *App) putSettings(w http.ResponseWriter, r *http.Request) {
 	if s.Radarr.APIKey == "" {
 		s.Radarr.APIKey = old.Radarr.APIKey
 	}
+	if s.Silo.APIKey == "" {
+		s.Silo.APIKey = old.Silo.APIKey
+	}
 	if s.Pushover.Token == "" {
 		s.Pushover.Token = old.Pushover.Token
 	}
@@ -365,7 +372,11 @@ func queryInt(r *http.Request, key string, def int) int {
 }
 func (a *App) listReleases(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	f := releaseFilter{Query: q.Get("q"), Window: q.Get("window"), Type: q.Get("type"), Group: q.Get("group"), Sort: q.Get("sort"), Page: queryInt(r, "page", 1), Limit: queryInt(r, "limit", 36)}
+	f := releaseFilter{Query: q.Get("q"), Window: q.Get("window"), Type: q.Get("type"), Group: q.Get("group"), Sort: q.Get("sort"), ListID: q.Get("list_id"), Page: queryInt(r, "page", 1), Limit: queryInt(r, "limit", 36)}
+	if f.ListID != "" && !numericID.MatchString(f.ListID) {
+		fail(w, 400, "invalid list_id")
+		return
+	}
 	if id := q.Get("actress_id"); id != "" {
 		n, e := strconv.ParseInt(id, 10, 64)
 		if e != nil || n < 1 {
@@ -427,7 +438,7 @@ func (a *App) patchRelease(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "monitored is required")
 		return
 	}
-	tag, e := a.db.Exec(r.Context(), `UPDATE releases SET monitored=$2,updated_at=now() WHERE id=$1`, id, *v.Monitored)
+	tag, e := a.db.Exec(r.Context(), `UPDATE releases SET monitored=$2,monitoring_override=$2,updated_at=now() WHERE id=$1`, id, *v.Monitored)
 	if e != nil {
 		fail(w, 500, "cannot update release")
 		return
@@ -439,7 +450,16 @@ func (a *App) patchRelease(w http.ResponseWriter, r *http.Request) {
 	a.releaseDetail(w, r)
 }
 func (a *App) listActresses(w http.ResponseWriter, r *http.Request) {
-	items, e := a.actresses(r.Context(), r.URL.Query().Get("q"), r.URL.Query().Get("group"))
+	upcoming := false
+	if raw := r.URL.Query().Get("upcoming_only"); raw != "" {
+		var err error
+		upcoming, err = strconv.ParseBool(raw)
+		if err != nil {
+			fail(w, 400, "invalid upcoming_only")
+			return
+		}
+	}
+	items, e := a.actresses(r.Context(), r.URL.Query().Get("q"), r.URL.Query().Get("group"), upcoming)
 	if e != nil {
 		fail(w, 500, "cannot list actresses")
 		return
@@ -501,13 +521,50 @@ func (a *App) patchActress(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "invalid watcher preferences")
 		return
 	}
-	tag, e := a.db.Exec(r.Context(), `UPDATE actresses SET data=data||$2::jsonb,updated_at=now() WHERE id=$1`, id, b)
+	tx, e := a.db.Begin(r.Context())
+	if e != nil {
+		fail(w, 500, "cannot update actress")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	var prior []byte
+	if e = tx.QueryRow(r.Context(), `SELECT data FROM actresses WHERE id=$1 FOR UPDATE`, id).Scan(&prior); e != nil {
+		resultError(w, e, "actress")
+		return
+	}
+	var before Actress
+	if e = json.Unmarshal(prior, &before); e != nil {
+		fail(w, 500, "cannot update actress")
+		return
+	}
+	before.ID = id
+	after := before
+	if v.Monitored != nil {
+		after.Monitored = *v.Monitored
+	}
+	if v.AutoAdd != nil {
+		after.AutoAdd = *v.AutoAdd
+	}
+	if v.Notify != nil {
+		after.Notify = *v.Notify
+	}
+	tag, e := tx.Exec(r.Context(), `UPDATE actresses SET data=data||$2::jsonb,updated_at=now() WHERE id=$1`, id, b)
 	if e != nil {
 		fail(w, 500, "cannot update actress")
 		return
 	}
 	if tag.RowsAffected() != 1 {
 		fail(w, 404, "actress not found")
+		return
+	}
+	if e = baselineActorActivation(r.Context(), tx, before, after); e == nil {
+		_, e = tx.Exec(r.Context(), recomputeMonitoring)
+	}
+	if e == nil {
+		e = tx.Commit(r.Context())
+	}
+	if e != nil {
+		fail(w, 500, "cannot update actress")
 		return
 	}
 	p, e = a.getActress(r.Context(), id)
@@ -522,13 +579,26 @@ func (a *App) deleteActress(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	tag, e := a.db.Exec(r.Context(), `DELETE FROM actresses WHERE id=$1`, id)
+	tx, e := a.db.Begin(r.Context())
+	if e != nil {
+		fail(w, 500, "cannot delete actress")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	tag, e := tx.Exec(r.Context(), `DELETE FROM actresses WHERE id=$1`, id)
 	if e != nil {
 		fail(w, 500, "cannot delete actress")
 		return
 	}
 	if tag.RowsAffected() == 0 {
 		fail(w, 404, "actress not found")
+		return
+	}
+	if _, e = tx.Exec(r.Context(), recomputeMonitoring); e == nil {
+		e = tx.Commit(r.Context())
+	}
+	if e != nil {
+		fail(w, 500, "cannot delete actress")
 		return
 	}
 	a.activity(r.Context(), "watcher", "Removed local watcher; remote MDBList favorites unchanged", "ok")
