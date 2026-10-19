@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { escapeHTML, artworkURL, releaseWindow, parsePersonIdentity, acquisitionTarget, calendarCells, buildSettingsPayload, normalizeSearchRow, settingsMatch, bulkScope, summarizeBulkResult } from '../app.js';
+import { ageYears, escapeHTML, artworkURL, releaseWindow, parsePersonIdentity, acquisitionTarget, calendarCells, buildSettingsPayload, normalizeSearchRow, settingsMatch, bulkScope, summarizeBulkResult } from '../app.js';
 
 test('artwork is always sent through allowlisted HTTPS proxy', () => {
   assert.equal(artworkURL('https://image.tmdb.org/t/p/w500/a.jpg'), '/api/artwork?url=https%3A%2F%2Fimage.tmdb.org%2Ft%2Fp%2Fw500%2Fa.jpg');
@@ -94,4 +94,15 @@ test('bulk outcomes preserve partial failure and reject inconsistent counts or d
 test('escapes untrusted metadata in text and attributes', () => {
   assert.equal(escapeHTML(`<img src="x" onerror='bad'>&`), '&lt;img src=&quot;x&quot; onerror=&#39;bad&#39;&gt;&amp;');
   assert.equal(escapeHTML(null), '');
+});
+
+test('ageYears validates calendar dates and birthday anniversaries including leap days',()=>{
+  assert.equal(ageYears('1993-08-16','2026-10-18'),33);
+  assert.equal(ageYears('1993-08-16','2026-08-15'),32);
+  assert.equal(ageYears('1993-08-16','2026-08-16'),33);
+  assert.equal(ageYears('2000-02-29','2025-02-28'),24);
+  assert.equal(ageYears('2000-02-29','2025-03-01'),25);
+  assert.equal(ageYears('2000-02-29','2024-02-29'),24);
+  for(const date of ['',null,'unknown','2026-02-29','1900-02-29','2026-04-31','2027-01-01','1993-8-16','0000-01-01'])assert.equal(ageYears(date,'2026-10-18'),null);
+  assert.equal(ageYears('1993-08-16','2026-02-30'),null);
 });

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -55,6 +56,11 @@ func (a *App) testIntegration(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]bool{"ok": true})
 }
 func (a *App) acquire(ctx context.Context, r Release, s Settings, target string, search bool, profile int, root string) (integrations.AddResult, error) {
+	return a.acquireWithRestore(ctx, r, s, target, search, false, profile, root)
+}
+
+// Restoration is explicit manual consent, never an automation or sync default.
+func (a *App) acquireWithRestore(ctx context.Context, r Release, s Settings, target string, search, restoreMonitoring bool, profile int, root string) (integrations.AddResult, error) {
 	if !oneOf(target, "radarr", "sonarr") {
 		return integrations.AddResult{}, errors.New("target must be radarr or sonarr")
 	}
@@ -80,7 +86,7 @@ func (a *App) acquire(ctx context.Context, r Release, s Settings, target string,
 	// The adapter validates selected options against remote values and verifies exact POST readback.
 	tmdb, _ := strconv.Atoi(r.TMDbID)
 	tvdb, _ := strconv.Atoi(r.TVDbID)
-	res, e := a.client(s).Add(ctx, target, integrations.Media{Title: r.Title, Type: r.Type, IMDbID: r.IMDbID, PosterURL: r.Poster, TMDbID: tmdb, TVDbID: tvdb, Year: r.Year}, integrations.AddOptions{QualityProfileID: profile, RootFolderPath: root, Monitored: true, Search: search, Tags: []int{}, MinimumAvailability: "released"})
+	res, e := a.client(s).Add(ctx, target, integrations.Media{Title: r.Title, Type: r.Type, IMDbID: r.IMDbID, PosterURL: r.Poster, TMDbID: tmdb, TVDbID: tvdb, Year: r.Year}, integrations.AddOptions{QualityProfileID: profile, RootFolderPath: root, Monitored: true, Search: search, RestoreMonitoring: restoreMonitoring, Tags: []int{}, MinimumAvailability: "released"})
 	if e != nil {
 		a.activity(ctx, "acquisition", fmt.Sprintf("%s: %s failed: %s", target, r.Title, providerError(e)), "error")
 		return res, e
@@ -89,11 +95,35 @@ func (a *App) acquire(ctx context.Context, r Release, s Settings, target string,
 	if res.AlreadyExists {
 		status = "already_exists"
 	}
-	_, e = a.db.Exec(ctx, `UPDATE releases SET acquisition=jsonb_set(acquisition,ARRAY[$2::text],to_jsonb($3::text)),updated_at=now() WHERE id=$1`, r.ID, target, status)
-	if e != nil {
-		return res, errors.New("remote add verified but local acquisition state could not be saved; retry is idempotent")
+	patch := map[string]string{target: status}
+	if restoreMonitoring {
+		// Adapter success proves exact membership, not download/file readiness.
+		// Merge only that evidence; leave file counts for read-only presence sync.
+		at := time.Now().UTC().Format(time.RFC3339Nano)
+		patch[target+"_status"] = "present"
+		patch[target+"_id"] = strconv.Itoa(res.ID)
+		patch[target+"_url"] = res.URL
+		patch[target+"_checked_at"] = at
+		patch[target+"_last_attempt_at"] = at
+		patch[target+"_last_check_status"] = "ok"
+		patch[target+"_error"] = ""
 	}
-	a.activity(ctx, "acquisition", fmt.Sprintf("%s %s: %s", target, status, r.Title), "ok")
+	raw, e := json.Marshal(patch)
+	if e != nil {
+		return res, e
+	}
+	_, e = a.db.Exec(ctx, `UPDATE releases SET acquisition=acquisition||$2::jsonb,updated_at=now() WHERE id=$1`, r.ID, raw)
+	if e != nil {
+		return res, errors.New("remote acquisition verified but local acquisition state could not be saved; inspect the manager before explicitly retrying")
+	}
+	detail := status
+	if res.MonitoredRestored {
+		detail += "; monitoring restored"
+	}
+	if res.SearchStarted {
+		detail += "; search started"
+	}
+	a.activity(ctx, "acquisition", fmt.Sprintf("%s %s: %s", target, detail, r.Title), "ok")
 	return res, nil
 }
 func (a *App) acquireRelease(w http.ResponseWriter, r *http.Request) {
@@ -124,7 +154,9 @@ func (a *App) acquireRelease(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, "cannot read settings")
 		return
 	}
-	res, e := a.acquire(r.Context(), release, s, v.Target, v.Search, v.QualityProfileID, v.RootFolder)
+	// A confirmed manual add includes monitoring restoration and a search,
+	// independently of the opt-in settings for unattended automation.
+	res, e := a.acquireWithRestore(r.Context(), release, s, v.Target, true, true, v.QualityProfileID, v.RootFolder)
 	if e != nil {
 		fail(w, 502, providerError(e))
 		return
@@ -133,11 +165,13 @@ func (a *App) acquireRelease(w http.ResponseWriter, r *http.Request) {
 }
 
 type bulkResult struct {
-	ReleaseID     int64  `json:"release_id"`
-	Title         string `json:"title"`
-	OK            bool   `json:"ok"`
-	AlreadyExists bool   `json:"already_exists"`
-	Error         string `json:"error"`
+	ReleaseID         int64  `json:"release_id"`
+	Title             string `json:"title"`
+	OK                bool   `json:"ok"`
+	AlreadyExists     bool   `json:"already_exists"`
+	MonitoredRestored bool   `json:"monitored_restored"`
+	SearchStarted     bool   `json:"search_started"`
+	Error             string `json:"error"`
 }
 
 func (a *App) acquireActress(w http.ResponseWriter, r *http.Request) {
@@ -189,13 +223,17 @@ func (a *App) acquireActress(w http.ResponseWriter, r *http.Request) {
 		if item.Type == "show" {
 			target = "sonarr"
 		}
-		res, e := a.acquire(r.Context(), item, s, target, v.Search, 0, "")
+		res, e := a.acquireWithRestore(r.Context(), item, s, target, true, true, 0, "")
 		if e != nil {
 			row.Error = providerError(e)
 			failed++
 		} else {
 			row.OK = true
 			row.AlreadyExists = res.AlreadyExists
+			row.MonitoredRestored = res.MonitoredRestored
+			row.SearchStarted = res.SearchStarted
+			// Preserve the count contract: existing records are not new adds.
+			// Verified restoration/search work is exposed separately on each row.
 			if res.AlreadyExists {
 				skipped++
 			} else {

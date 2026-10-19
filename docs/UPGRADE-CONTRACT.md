@@ -27,6 +27,12 @@ Task fields: id:int,type:catalog_sync|silo_sync|search_missing,name:string,enabl
 - Release details GET /api/releases/{id}/watchlist returns status present|absent|unknown,in_watchlist boolean|null. POST same path body {in_watchlist:boolean} performs the explicit MDBList watchlist add/remove and verifies exact remote state before reporting verified:true. No background task or discovery may mutate the account watchlist. Partial/pagination/error responses never prove absence.
 - Watchlist worker owns internal/integrations/mdblist_watchlist* and internal/app/watchlist*. Parent owns upgrade_routes.go and startup/ticker wiring; backend calls registerUpgradeRoutes from HTTPHandler.
 
+## Explicit manual Add: restore monitoring and search
+- The user explicitly requested that adding an existing unmonitored movie, show or season re-enable monitoring and search. Manual single/bulk confirmation must disclose this and send search=true.
+- Adapter AddOptions.RestoreMonitoring is opt-in for explicit manual operations only. Read-only Arr reconciliation and background catalogue synchronization must not mutate manager monitoring or launch searches.
+- Existing exact manager records are updated in place, preserving paths, quality profiles, tags and unrelated fields. Sonarr series monitoring and every returned season flag are restored; fresh exact-ID readback must verify the requested flags before a single scoped MoviesSearch/SeriesSearch command.
+- Report monitored_restored and search_started only from verified adapter outcomes. An uncertain mutation/readback is an error, never an automatic retry. Existing records must not be duplicated.
+
 ## Ownership
 Core agent: internal/app backend except silo.go/silo_test.go, schedules.go/schedules_test.go and web. Own models/store/providers/credits/acquisition/settings/http and migration003 policy/reset. Add SiloSettings type/Settings.Silo fields as above, preserve blank key, configured/redacted output. Core wires new list/cast/person handlers in its HTTP route registration, but parent wires Silo/schedule routes and app lifecycle. Do not change app.go lifecycle or original001 migration (parent owns migration loader).
 Frontend agent: ONLY internal/app/web including tests. All listed UI additions and existing search-ID nesting bug if necessary to exercise manual-add flow. No root files.

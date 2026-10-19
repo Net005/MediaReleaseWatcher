@@ -36,6 +36,12 @@ func (c *Client) ArrSearchGuarded(ctx context.Context, kind string, id int, medi
 	}
 	c.addMu.Lock()
 	defer c.addMu.Unlock()
+	return c.arrSearchLocked(ctx, service, id, media, beforePost, nil)
+}
+
+// arrSearchLocked requires addMu; validation runs on the final fresh item read.
+func (c *Client) arrSearchLocked(ctx context.Context, service arrService, id int, media Media, beforePost func(context.Context) error, validate func(arrItem) error) error {
+	kind := service.kind
 	item, err := c.readArr(ctx, service, id)
 	if err != nil {
 		return err
@@ -45,6 +51,11 @@ func (c *Client) ArrSearchGuarded(ctx context.Context, kind string, id int, medi
 	}
 	if item.Monitored == nil || !*item.Monitored {
 		return errors.New("search requires a monitored manager item")
+	}
+	if validate != nil {
+		if err := validate(item); err != nil {
+			return err
+		}
 	}
 	name := "MoviesSearch"
 	payload := map[string]any{"name": name, "movieIds": []int{id}}

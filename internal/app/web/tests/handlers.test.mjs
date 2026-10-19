@@ -21,7 +21,7 @@ before(async () => {
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));origin=`http://127.0.0.1:${server.address().port}`;
 });
 after(async()=>{await browser?.close();if(server)await new Promise(resolve=>server.close(resolve));});
-async function app({authenticated=true,needsSetup=false,withRelease=false,configuredArr=false,hash='',handle,autoScroll=false}={}) {
+async function app({authenticated=true,needsSetup=false,withRelease=false,configuredArr=false,hash='',handle,autoScroll=false,artworkSVG}={}) {
   const page=await browser.newPage();page.setDefaultTimeout(4000);
   if(!autoScroll)await page.addInitScript(()=>{window.IntersectionObserver=undefined;});
   const requests=[],errors=[];page.on('pageerror',error=>errors.push(error.message));
@@ -29,6 +29,7 @@ async function app({authenticated=true,needsSetup=false,withRelease=false,config
   if(configuredArr)settings.radarr={url:'http://arr.test',configured:true,enabled:true,search:true,root_folder:'/media/movies',quality_profile_id:7};
   await page.route('**/api/**',async route=>{
     const request=route.request(),url=new URL(request.url()),path=url.pathname,method=request.method();const body=request.postDataJSON();requests.push({path,method,body,query:Object.fromEntries(url.searchParams)});
+    if(path==='/api/artwork'&&artworkSVG){await route.fulfill({status:200,contentType:'image/svg+xml',body:artworkSVG});return;}
     const custom=await handle?.({path,method,body,query:Object.fromEntries(url.searchParams)});
     if(custom){await route.fulfill({status:custom.status||200,contentType:'application/json',body:JSON.stringify(custom.data)});return;}
     let data={ok:true},status=200;
@@ -296,7 +297,7 @@ test('release cast opens source person details and explains list and actress mon
   }});
   try {
     const detail=page.locator('dialog[data-release-id="1"]');await detail.getByText('Synthetic source',{exact:false}).waitFor();await detail.getByText('Actress watch rule (Auto-add / Notify)',{exact:true}).waitFor();
-    await detail.getByRole('button',{name:'Already in Radarr',exact:true}).waitFor();await detail.getByText('Silo presence unknown',{exact:true}).waitFor();
+    await detail.getByRole('button',{name:'Monitor & search in Radarr',exact:true}).waitFor();await detail.getByText('Silo presence unknown',{exact:true}).waitFor();
     await detail.getByRole('button',{name:'View person Synthetic actor <script>',exact:true}).click();
     const person=page.getByRole('dialog',{name:'Person details',exact:true});await person.getByText('Source biography',{exact:true}).waitFor();await person.getByText('00123',{exact:true}).waitFor();assert.equal(await page.locator('script:not([src])').count(),0);assert.deepEqual(errors,[]);
   }finally{await page.close();}
@@ -338,7 +339,69 @@ test('Silo presence badges reflect catalog lookup and safe links, not Arr presen
   const {page,errors}=await app({hash:'#/releases',handle:({path})=>path==='/api/releases'?{data:{items:statuses.map((status,index)=>({...release(),id:index+1,acquisition:{radarr:index===3?'failed':'already_exists'},local_availability:{status,url:index===0?'https://silo.test/item/1':'javascript:alert(1)',checked_at:'2026-10-18T12:00:00Z'}})),total:4,page:1,limit:36}}:undefined});
   try {
     await page.locator('.release-card').nth(3).waitFor();for(const [index,label] of ['In Silo','Not in Silo','Silo presence unknown','Silo lookup failed'].entries())await page.locator('.release-card').nth(index).getByText(label,{exact:true}).waitFor();
-    assert.equal(await page.getByRole('link',{name:'Open in Silo',exact:true}).count(),1);assert.equal(await page.getByRole('link',{name:'Open in Silo',exact:true}).getAttribute('href'),'https://silo.test/item/1');assert.equal(await page.getByRole('button',{name:'Already in Radarr',exact:true}).count(),3);assert.deepEqual(errors,[]);
+    assert.equal(await page.getByRole('link',{name:'Open in Silo',exact:true}).count(),1);assert.equal(await page.getByRole('link',{name:'Open in Silo',exact:true}).getAttribute('href'),'https://silo.test/item/1');assert.equal(await page.getByRole('button',{name:'Monitor & search in Radarr',exact:true}).count(),3);assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+for(const [type,target,name] of [['movie','radarr','Radarr'],['show','sonarr','Sonarr']])test(`known unmonitored ${type} explicitly restores monitoring and searches`,async()=>{
+  const item={...release(),type,acquisition:{[target]:'already_exists',[target+'_status']:'present',[target+'_ready']:'false'}};
+  const {page,requests,errors}=await app({withRelease:true,hash:'#/release/1',handle:({path})=>{
+    if(path==='/api/releases/1')return {data:item};
+    if(path==='/api/settings')return {data:{...defaults(),[target]:{configured:true,enabled:true,quality_profile_id:7,root_folder:'/media/movies',search:false}}};
+    if(path==='/api/releases/1/acquire')return {data:{ok:true,result:{id:11,already_exists:true,monitored_restored:true,search_started:true}}};
+  }});
+  try {
+    const detail=page.locator('dialog[data-release-id="1"]');
+    await detail.getByText(`${name} inventory: present`,{exact:true}).waitFor();
+    await detail.getByRole('button',{name:`Monitor & search in ${name}`,exact:true}).click();
+    const dialog=page.getByRole('dialog',{name:`Monitor & search in ${name}?`,exact:true});
+    await dialog.getByText('Existing entries will be set to monitored, including all Sonarr seasons. New entries will also be monitored. A search will start and may download media.',{exact:true}).waitFor();
+    assert.equal(await dialog.locator('[name=search]').isChecked(),true);assert.equal(await dialog.locator('[name=search]').isDisabled(),true);
+    assert.equal(requests.some(r=>r.path.endsWith('/acquire')),false);
+    await dialog.getByRole('button',{name:'Confirm monitor & search',exact:true}).click();
+    await dialog.getByText('Monitoring restored. Search started.',{exact:true}).waitFor();
+    assert.deepEqual(requests.find(r=>r.path.endsWith('/acquire')).body,{target,search:true,quality_profile_id:7,root_folder:'/media/movies'});assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('single outcomes do not invent unconfirmed restoration or search success',async()=>{
+  const {page,requests}=await app({withRelease:true,configuredArr:true,hash:'#/release/1',handle:({path})=>path==='/api/releases/1/acquire'?{data:{ok:true,result:{id:11,already_exists:true,monitored_restored:false,search_started:false}}}:path==='/api/releases/1'?{data:{...release(),acquisition:{radarr:'already_exists'}}}:undefined});
+  try {
+    await page.locator('dialog[data-release-id="1"] [data-action=acquire]').click();const dialog=page.getByRole('dialog',{name:'Monitor & search in Radarr?',exact:true});
+    await dialog.getByRole('button',{name:'Confirm monitor & search',exact:true}).click();
+    await dialog.getByText('Monitoring restoration not confirmed. Search start not confirmed. Check Activity before retrying.',{exact:true}).waitFor();
+    assert.equal(await dialog.getByText('Search started.',{exact:true}).count(),0);assert.equal(requests.filter(r=>r.path.endsWith('/acquire')).length,1);
+  }finally{await page.close();}
+});
+
+test('bulk existing outcomes expose restored monitoring and verified searches without changing counts',async()=>{
+  const item={...release(),title:'<img src=x onerror=alert(1)>',acquisition:{radarr:'already_exists'}};
+  const {page,requests,errors}=await app({withRelease:true,configuredArr:true,hash:'#/actresses',handle:({path})=>{
+    if(path==='/api/actresses/2')return {data:{actress:actress(),releases:[item],total:1}};
+    if(path==='/api/actresses/2/acquire')return {data:{results:[{release_id:1,title:item.title,ok:true,already_exists:true,monitored_restored:true,search_started:true}],added:0,failed:0,skipped:1}};
+  }});
+  try {
+    await page.locator('.actress-card [data-action=actress]').first().click();await page.getByRole('button',{name:'Add matched releases',exact:true}).click();const dialog=page.getByRole('dialog',{name:'Add matched releases?',exact:true});
+    assert.equal(await dialog.locator('[name=search]').isChecked(),true);assert.equal(await dialog.locator('[name=search]').isDisabled(),true);
+    assert.equal(requests.some(r=>r.path.endsWith('/acquire')),false);await dialog.getByRole('button',{name:'Confirm bulk add',exact:true}).click();
+    await dialog.locator('.bulk-result').getByText('Monitoring restored. Search started.',{exact:true}).waitFor();await dialog.getByText('1 already present',{exact:true}).waitFor();await dialog.getByText('0 excluded by scope',{exact:true}).waitFor();
+    assert.equal(await dialog.locator('.bulk-result img').count(),0);assert.deepEqual(requests.find(r=>r.path.endsWith('/acquire')).body,{scope:'all',search:true});assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+test('watch and cast person birthdays share an inline age badge without mobile overflow',async()=>{
+  const person={...actress(),birthday:'1993-08-16',biography:'Unchanged biography'};
+  const {page,errors}=await app({withRelease:true,hash:'#/actresses',handle:({path})=>{
+    if(path==='/api/actresses/2')return {data:{actress:person,releases:[],total:0}};
+    if(path==='/api/releases/1/cast')return {data:{items:[{...person,id:22}],coverage:'Test'}};
+    if(path==='/api/people/123456')return {data:{person,releases:[]}};
+  }});
+  try {
+    await page.clock.install({time:new Date('2026-10-18T12:00:00Z')});
+    await page.locator('.actress-card [data-action=actress]').first().click();let dialog=page.getByRole('dialog',{name:'Actress watch',exact:true});
+    for(const width of [1280,390]){await page.setViewportSize({width,height:850});await dialog.locator('.birthday-fact .badge').getByText('33 years old',{exact:true}).waitFor();assert.equal(await dialog.evaluate(el=>el.scrollWidth<=el.clientWidth),true);}
+    await page.keyboard.press('Escape');await page.goto(origin+'#/release/1');await page.locator('[data-action=person]').first().click();dialog=page.getByRole('dialog').last();
+    await dialog.locator('.birthday-fact .badge').getByText('33 years old',{exact:true}).waitFor();assert.equal(await dialog.evaluate(el=>el.scrollWidth<=el.clientWidth),true);assert.deepEqual(errors,[]);
   }finally{await page.close();}
 });
 
@@ -355,10 +418,10 @@ test('release detail supports verified monitoring and explicit single acquisitio
     const confirm=page.getByRole('dialog',{name:'Add to Radarr?'});
     await confirm.waitFor();
     assert.equal(requests.some(r=>r.path.endsWith('/acquire')),false);
-    assert.equal(await confirm.locator('[name=search]').isChecked(),false);
+    assert.equal(await confirm.locator('[name=search]').isChecked(),true);
     await confirm.getByRole('button',{name:'Confirm add',exact:true}).click();
     await confirm.getByText('Added and verified in Radarr.',{exact:true}).waitFor();
-    assert.deepEqual(requests.find(r=>r.path==='/api/releases/1/acquire').body,{target:'radarr',search:false,quality_profile_id:7,root_folder:'/media/movies'});
+    assert.deepEqual(requests.find(r=>r.path==='/api/releases/1/acquire').body,{target:'radarr',search:true,quality_profile_id:7,root_folder:'/media/movies'});
     await confirm.getByRole('button',{name:'Close dialog',exact:true}).click();
     await confirm.waitFor({state:'detached'});
     await page.keyboard.press('Escape');
@@ -396,7 +459,7 @@ test('bulk acquisition confirms exact scope and renders every verified outcome',
     await dialog.getByRole('button',{name:'Confirm bulk add',exact:true}).click();
     await dialog.locator('.bulk-summary').getByText('1 added',{exact:true}).waitFor();
     await dialog.locator('.bulk-result').getByText('Added',{exact:true}).waitFor();
-    assert.deepEqual(requests.find(r=>r.path==='/api/actresses/2/acquire').body,{scope:'all',search:false});
+    assert.deepEqual(requests.find(r=>r.path==='/api/actresses/2/acquire').body,{scope:'all',search:true});
     assert.equal(await dialog.locator('.bulk-result').count(),1);
     await dialog.getByText('Local acquisition readback verified.',{exact:true}).waitFor();
     assert.deepEqual(errors,[]);
@@ -495,4 +558,55 @@ test('browser initializes authenticated session and all six navigation views',as
     await page.locator('#radarr-result').getByText('Connection verified.',{exact:true}).waitFor();
     assert.deepEqual(errors,[]);
   } finally {await page.close();}
+});
+
+
+test('actress portraits show the full source image without a face-obscuring fade on desktop and mobile',async()=>{
+ const svg='<svg xmlns="http://www.w3.org/2000/svg" width="400" height="600"><rect width="400" height="600" fill="#d9e5ee"/><ellipse cx="200" cy="260" rx="125" ry="170" fill="#ba8d71"/><circle cx="150" cy="220" r="10"/><circle cx="250" cy="220" r="10"/><path d="M155 330 Q200 365 245 330" fill="none" stroke="#713e35" stroke-width="10"/><path d="M50 600 Q50 420 200 420 Q350 420 350 600" fill="#314d6c"/></svg>';
+ const {page,errors}=await app({hash:'#/actresses',artworkSVG:svg,handle:({path})=>path==='/api/actresses'?{data:{items:[{...actress(),profile:'https://image.tmdb.org/t/p/w342/synthetic-portrait.png'}],total:1}}:undefined});
+ try {
+  const portrait=page.locator('.actress-portrait');const image=portrait.locator('img');await image.waitFor();
+
+  await page.waitForFunction(()=>document.querySelector('.actress-portrait img')?.naturalHeight===600);
+  for(const width of [1440,1920,390]) {
+   await page.setViewportSize({width,height:1000});
+   const style=await image.evaluate(img=>{const portrait=img.closest('.actress-portrait'),box=portrait.getBoundingClientRect();return {fit:getComputedStyle(img).objectFit,fade:getComputedStyle(portrait,'::after').backgroundImage,width:box.width,height:box.height};});
+   assert.equal(style.fit,'contain',`Full portrait must remain visible at ${width}px, not cover-cropped`);
+   assert.equal(style.fade,'none',`A gradient must not obscure the face at ${width}px`);
+   if(width>540)assert.ok(style.height/style.width>=1.45,'Desktop portrait must have portrait proportions, not a shallow banner');
+   else assert.ok(await portrait.evaluate(node=>node.getBoundingClientRect().right<=node.parentElement.querySelector('.actress-body').getBoundingClientRect().left+1),'Mobile portrait must not overlap the name and biography');
+   assert.ok(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1),'Portrait must not cause horizontal overflow');
+  }
+  assert.deepEqual(errors,[]);
+ }finally{await page.close();}
+});
+
+
+test('release details label supplied MDBList title links beside provider links without unsafe destinations',async()=>{
+  const source='https://mdblist.com/movie/7ry-the-turin-horse';
+  const {page,errors}=await app({withRelease:true,hash:'#/release/1',handle:({path})=>path==='/api/releases/1'?{data:{...release(),source_links:[source,'https://www.themoviedb.org/movie/654321','javascript:alert(1)','https://mdblist.com.evil/movie/tt0200374']}}:undefined});
+  try {
+    const link=page.getByRole('link',{name:'MDBList title',exact:true});await link.waitFor();
+    assert.equal(await link.getAttribute('href'),source);assert.equal(await link.getAttribute('rel'),'noopener noreferrer');
+    assert.equal(await link.locator('..').getByRole('link',{name:'IMDb title',exact:true}).count(),1);
+    assert.equal(await page.locator('a[href^="javascript:"]').count(),0);assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
+
+test('watch and cast details omit ages for missing invalid and future birthdays',async()=>{
+  for(const birthday of [undefined,'2026-02-29','2999-01-01']) {
+    const person={...actress(),birthday};
+    const {page}=await app({withRelease:true,hash:'#/actresses',handle:({path})=>{
+      if(path==='/api/actresses/2')return {data:{actress:person,releases:[],total:0}};
+      if(path==='/api/releases/1/cast')return {data:{items:[person],coverage:'Test'}};
+      if(path==='/api/people/123456')return {data:{person,releases:[]}};
+    }});
+    try {
+      await page.locator('.actress-card [data-action=actress]').first().click();
+      await page.locator('.birthday-fact').waitFor();assert.equal(await page.locator('.birthday-fact .badge').count(),0);
+      await page.keyboard.press('Escape');await page.goto(origin+'#/release/1');await page.locator('[data-action=person]').first().click();
+      await page.locator('.birthday-fact').waitFor();assert.equal(await page.locator('.birthday-fact .badge').count(),0);
+    }finally{await page.close();}
+  }
 });

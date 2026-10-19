@@ -103,7 +103,7 @@ Only explicit source-linked identities produce actress/title matches. When missi
 Configure each service's base URL, API key, quality profile and root folder in Settings. URLs may include the service's installation prefix; do not append `/api/v3`. If the manager runs on another machine, use an address reachable from the application container. `localhost` inside the app container refers to the app container, not your host or another service.
 
 - **Movies → Radarr. Series → Sonarr.** The app rejects incompatible targets.
-- Quick-add and bulk-add are explicit web actions. Search-on-add is an explicit option; an add is not proof that a download completed.
+- Quick-add and bulk-add are explicit confirmed web actions that monitor and search. If a title already exists, the app restores movie or series monitoring and all returned Sonarr season monitoring, verifies the saved flags, then requests one scoped search. Existing paths, profiles and tags are preserved. A search request is not proof that a download completed.
 - Automatic acquisition additionally requires a monitored title, an explicit per-list or per-actress automatic-add rule, the global switch, and a configured/enabled destination.
 - Existing items are checked before adding. A new add is read back from the exact remote ID before success is recorded. Uncertain or partial results remain visible.
 

@@ -35,16 +35,21 @@ type Media struct {
 	TMDbID, TVDbID, Year           int
 }
 type AddOptions struct {
-	QualityProfileID    int
-	RootFolderPath      string
-	Monitored, Search   bool
+	QualityProfileID  int
+	RootFolderPath    string
+	Monitored, Search bool
+	// RestoreMonitoring is explicit manual consent for an existing exact item.
+	// Leave false for automatic acquisition and read-only reconciliation.
+	RestoreMonitoring   bool
 	Tags                []int
 	MinimumAvailability string
 }
 type AddResult struct {
-	ID            int    `json:"id"`
-	AlreadyExists bool   `json:"already_exists"`
-	URL           string `json:"url"`
+	ID                int    `json:"id"`
+	AlreadyExists     bool   `json:"already_exists"`
+	URL               string `json:"url"`
+	MonitoredRestored bool   `json:"monitored_restored"`
+	SearchStarted     bool   `json:"search_started"`
 }
 type Notification struct {
 	Title, Message, URL, URLTitle, Device, AttachmentName string

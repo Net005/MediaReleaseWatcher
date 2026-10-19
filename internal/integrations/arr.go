@@ -67,8 +67,9 @@ func (c *Client) ArrOptions(ctx context.Context, kind string) (Options, error) {
 }
 
 type arrSeason struct {
-	SeasonNumber int  `json:"seasonNumber"`
-	Monitored    bool `json:"monitored"`
+	SeasonNumber    int  `json:"seasonNumber"`
+	Monitored       bool `json:"monitored"`
+	monitoringKnown bool
 }
 type arrItem struct {
 	ID                  int         `json:"id"`
@@ -208,6 +209,9 @@ func (c *Client) Add(ctx context.Context, kind string, media Media, options AddO
 		return zero, err
 	}
 	if presence.ID > 0 {
+		if options.RestoreMonitoring {
+			return c.restoreArrLocked(ctx, s, presence.ID, media, options.Search)
+		}
 		verified, err := c.readArr(ctx, s, presence.ID)
 		if err != nil {
 			return zero, fmt.Errorf("%s existing-item readback failed: %w", kind, err)
