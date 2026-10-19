@@ -94,7 +94,7 @@ This is a **synthetic format example**, not a real performer record. Top-level f
 
 MDBList is the primary backend for title metadata, images and biographies. Its person-detail endpoint does **not** provide complete filmographies, and membership in a multi-actress list does **not** establish that every actress appears in every title.
 
-Only explicit source-linked identities produce actress/title matches. When missing television credits need a supplement, the app can resolve an exact name/date-of-birth identity using TVmaze's public cast-credit API, then obtain the title metadata from MDBList. This is television-only, source-attributed and cached—not a claim of complete movie or television coverage. An optional `TMDB_API_KEY` environment variable supports additional missing-credit lookups where configured. Adding a local watcher never silently changes your MDBList favorites.
+Only explicit source-linked identities produce actress/title matches. Active discovery and person details no longer request TVmaze. Previously verified television matches retain their original attribution; they are not deleted or relabelled as MDBList evidence. MDBList catalogue/list/upcoming feeds provide bounded discovery, not complete actor filmographies. An optional `TMDB_API_KEY` environment variable supports actual title-cast lookups where configured. Adding a local watcher never silently changes your MDBList favorites. Sparse person responses are reported as partial, and both scheduled and manual sync persist progress and final partial/failure states instead of claiming complete coverage.
 
 **Missing and ambiguous information stays missing or ambiguous.** A low database score is not an age rating; a keyword is not proof of a nude scene; a provider name is not proof of playback availability in your country. Official/aggregate certification, suggested age and review ratings are displayed as different measures.
 
@@ -156,7 +156,7 @@ GitHub Actions runs Go tests/vet, frontend unit and browser-workflow tests, buil
 ## Sources and attribution
 
 - Primary metadata: [MDBList](https://mdblist.com/), [API documentation](https://api.mdblist.com/docs/).
-- Supplemental TV cast credits: [TVmaze](https://www.tvmaze.com/), [API and licensing](https://www.tvmaze.com/api), [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). Source links are retained with matched records.
+- Historical supplemental TV cast attribution: [TVmaze](https://www.tvmaze.com/), [API and licensing](https://www.tvmaze.com/api), [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/). Existing source links are retained; active discovery does not call TVmaze.
 - [Sonarr API](https://sonarr.tv/docs/api/), [Radarr API](https://radarr.video/docs/api/), [Pushover API](https://pushover.net/api).
 
 Artwork remains owned by its respective rights holders. Personal credentials, account responses, watch lists and deployment state are runtime data—not repository fixtures.

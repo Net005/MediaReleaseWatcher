@@ -476,7 +476,7 @@ func (a *App) actressDetail(w http.ResponseWriter, r *http.Request) {
 		resultError(w, e, "actress")
 		return
 	}
-	a.queueCredits(id)
+	p.MetadataStatus = currentPersonMetadataStatus(p.MetadataStatus)
 	releases, e := a.allMatched(r.Context(), id)
 	if e != nil {
 		fail(w, 500, "cannot list matched releases")

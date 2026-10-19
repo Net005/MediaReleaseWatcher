@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -121,11 +122,17 @@ func providerError(e error) string {
 func (a *App) enrichPerson(ctx context.Context, s Settings, p Actress) Actress {
 	raw, e := a.mdb(ctx, s, "/people/"+p.TMDbID, nil)
 	if e != nil {
+		if strings.HasPrefix(p.MetadataStatus, "unavailable: identity mismatch") {
+			return p
+		}
 		p.MetadataStatus = "unavailable: " + providerError(e) + "; supplied identity retained. MDBList biographies do not provide filmographies."
 		return p
 	}
 	m, e := decodeObject(raw)
 	if e != nil {
+		if strings.HasPrefix(p.MetadataStatus, "unavailable: identity mismatch") {
+			return p
+		}
 		p.MetadataStatus = "unavailable: invalid MDBList biography"
 		return p
 	}
@@ -152,7 +159,16 @@ func (a *App) enrichPerson(ctx context.Context, s Settings, p Actress) Actress {
 	if v := first(m, "place_of_birth"); v != "" {
 		p.PlaceOfBirth = v
 	}
-	p.MetadataStatus = "ok: MDBList biography; matches require explicit cast/person links, not filmography"
+	missing := []string{}
+	for _, field := range []struct{ name, value string }{{"portrait", first(m, "profile", "avatar")}, {"biography", first(m, "biography")}, {"birthday", dateOnly(first(m, "birthday"))}, {"place of birth", first(m, "place_of_birth")}} {
+		if strings.TrimSpace(field.value) == "" {
+			missing = append(missing, field.name)
+		}
+	}
+	p.MetadataStatus = "ok: MDBList person fields present; matches require explicit cast/person links, not filmography"
+	if len(missing) > 0 {
+		p.MetadataStatus = "partial: MDBList responded; missing " + strings.Join(missing, ", ") + "; no filmography inferred"
+	}
 	return p
 }
 func (a *App) addActress(w http.ResponseWriter, r *http.Request) {
@@ -473,7 +489,10 @@ func parseDiscovery(raw json.RawMessage) ([]discoveryRow, string, bool, error) {
 func (a *App) stage(ctx context.Context, s string) {
 	a.mu.Lock()
 	a.syncState.Stage = s
+	state := a.syncState
 	a.mu.Unlock()
+	b, _ := json.Marshal(state)
+	_, _ = a.db.Exec(ctx, `INSERT INTO app_state(key,value) VALUES('sync',$1) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, b)
 	a.activity(ctx, "sync", s, "running")
 }
 func (a *App) startSync() bool {
@@ -489,59 +508,127 @@ func (a *App) startSync() bool {
 		defer a.wg.Done()
 		ctx, cancel := context.WithTimeout(a.ctx, 6*time.Hour)
 		defer cancel()
-		e := a.syncOnce(ctx)
-		now := time.Now().UTC()
-		a.mu.Lock()
-		a.syncState.Running = false
-		a.syncState.LastRun = &now
-		a.syncState.LastError = ""
-		a.syncState.Stage = "idle"
-		if e != nil {
-			a.syncState.LastError = providerError(e)
-			a.syncState.Stage = "failed"
-		}
-		state := a.syncState
-		a.mu.Unlock()
-		b, _ := json.Marshal(state)
-		saveCtx, done := context.WithTimeout(context.WithoutCancel(a.ctx), 5*time.Second)
-		defer done()
-		_, _ = a.db.Exec(saveCtx, `INSERT INTO app_state(key,value) VALUES('sync',$1) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, b)
-		if e != nil {
-			a.activity(saveCtx, "sync", providerError(e), "error")
-		} else {
-			a.activity(saveCtx, "sync", "Sync completed; source coverage and actual person links persisted", "ok")
+		if err := a.syncOnce(ctx); err != nil {
+			// A rejected lease never owns persisted state. Clear only our local
+			// reservation, not another worker's running/progress state.
+			a.mu.Lock()
+			if a.syncState.Stage == "starting" && a.syncState.Running {
+				a.syncState.Running = false
+				a.syncState.Stage = "failed"
+				a.syncState.LastError = providerError(err)
+			}
+			a.mu.Unlock()
 		}
 	}()
 	return true
 }
+
+// syncBiographyPage avoids the unbounded UI list and its per-person match queries.
+func (a *App) syncBiographyPage(ctx context.Context, after int64) ([]Actress, error) {
+	rows, err := a.db.Query(ctx, `SELECT id,data,updated_at FROM actresses WHERE id>$1 ORDER BY id LIMIT 500`, after)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	people := []Actress{}
+	for rows.Next() {
+		var p Actress
+		var raw []byte
+		var id int64
+		var updated time.Time
+		if err = rows.Scan(&id, &raw, &updated); err != nil {
+			return nil, err
+		}
+		if err = json.Unmarshal(raw, &p); err != nil {
+			return nil, err
+		}
+		p.ID = id
+		p.UpdatedAt = updated
+		people = append(people, p)
+	}
+	return people, rows.Err()
+}
+
+// syncCompletion is a per-run value snapshot, never a reference to live progress.
+type syncCompletion struct {
+	Status  string
+	Message string
+}
+
+// syncOnce preserves the error-only API for manual and existing callers.
 func (a *App) syncOnce(ctx context.Context) error {
-	s, e := a.settings(ctx)
-	if e != nil {
-		return e
-	}
-	if s.MDBList.APIKey == "" {
-		return errors.New("MDBList API key is not configured")
-	}
+	_, err := a.syncOnceResult(ctx)
+	return err
+}
+
+// syncOnceResult captures completion while this run still owns the sync lease.
+// Rejected leases return a zero completion and an error without changing progress.
+func (a *App) syncOnceResult(ctx context.Context) (result syncCompletion, runErr error) {
 	conn, e := a.db.Acquire(ctx)
 	if e != nil {
-		return e
+		return result, e
 	}
 	defer conn.Release()
 	var locked bool
 	if e = conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(486722121)`).Scan(&locked); e != nil {
-		return e
+		return result, e
 	}
 	if !locked {
-		return errors.New("sync already running in another process")
+		return result, errors.New("sync already running in another process")
 	}
 	defer func() {
 		unlock, done := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer done()
 		_, _ = conn.Exec(unlock, `SELECT pg_advisory_unlock(486722121)`)
 	}()
+
+	summary := ""
+	a.mu.Lock()
+	a.syncState.Running = true
+	a.syncState.LastError = ""
+	a.mu.Unlock()
+	a.stage(ctx, "starting")
+	defer func() {
+		now := time.Now().UTC()
+		a.mu.Lock()
+		a.syncState.Running = false
+		a.syncState.LastRun = &now
+		a.syncState.Stage = "idle"
+		a.syncState.LastError = summary
+		status, message := "ok", "Sync completed; source coverage and actual person links persisted"
+		if summary != "" {
+			a.syncState.Stage = "partial"
+			status = "warning"
+			message = summary
+		}
+		if runErr != nil {
+			a.syncState.Stage = "failed"
+			a.syncState.LastError = providerError(runErr)
+			status = "error"
+			message = a.syncState.LastError
+		}
+		result = syncCompletion{Status: status, Message: message}
+		state := a.syncState
+		a.mu.Unlock()
+		save, done := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer done()
+		b, _ := json.Marshal(state)
+		if _, err := a.db.Exec(save, `INSERT INTO app_state(key,value) VALUES('sync',$1) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, b); err != nil {
+			log.Printf("persist sync completion: %v", err)
+		}
+		a.activity(save, "sync", message, status)
+	}()
+	s, e := a.settings(ctx)
+	if e != nil {
+		return result, e
+	}
+	if s.MDBList.APIKey == "" {
+		return result, errors.New("MDBList API key is not configured")
+	}
+
 	var baseline bool
 	if e = a.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM app_state WHERE key='baseline')`).Scan(&baseline); e != nil {
-		return e
+		return result, e
 	}
 	candidates := map[int64]Release{}
 	activeList := ""
@@ -623,7 +710,7 @@ func (a *App) syncOnce(ctx context.Context) error {
 	// Legacy encrypted settings may not have persisted policy rows yet.
 	tx, err := a.db.Begin(ctx)
 	if err != nil {
-		return err
+		return result, err
 	}
 	if err = syncListPolicies(ctx, tx, s); err == nil {
 		err = tx.Commit(ctx)
@@ -631,7 +718,7 @@ func (a *App) syncOnce(ctx context.Context) error {
 		_ = tx.Rollback(ctx)
 	}
 	if err != nil {
-		return err
+		return result, err
 	}
 	for _, list := range configuredLists(s.MDBList) {
 		if !list.Enabled {
@@ -639,29 +726,29 @@ func (a *App) syncOnce(ctx context.Context) error {
 		}
 		activeList = list.ID
 		if e = pageFeed("/lists/"+list.ID+"/items", false, url.Values{"limit": {"1000"}, "append_to_response": {"poster,description,genres,ratings"}}); e != nil {
-			return e
+			return result, e
 		}
 		if e = a.replaceListMembership(ctx, list.ID, listMembers[list.ID]); e != nil {
-			return e
+			return result, e
 		}
 	}
 	activeList = ""
 	a.stage(ctx, "Loading favorites-upcoming and explicit matched-person relationships")
 	if e = pageFeed("/people/favorites/upcoming", true, url.Values{"limit": {"100"}}); e != nil {
-		return e
+		return result, e
 	}
 	// Incremental broad catalog discovery is bounded by dates, never claimed as complete filmography.
 	for _, kind := range []string{"movie", "show"} {
 		a.stage(ctx, "Reading recent/upcoming MDBList "+kind+" catalog")
 		if e = pageFeed("/catalog/"+kind, false, url.Values{"limit": {"100"}, "released_from": {time.Now().UTC().AddDate(0, 0, -30).Format("2006-01-02")}, "released_to": {time.Now().UTC().AddDate(0, 3, 0).Format("2006-01-02")}, "sort": {"released"}, "append_to_response": {"poster,description,genres,ratings"}}); e != nil {
-			return e
+			return result, e
 		}
 	}
 	// Include persisted monitored titles even if removed from source lists.
 	for page := 1; ; page++ {
 		saved, e := a.releases(ctx, releaseFilter{Page: page, Limit: 500})
 		if e != nil {
-			return e
+			return result, e
 		}
 		for _, r := range saved.Items {
 			if r.Monitored {
@@ -686,11 +773,11 @@ func (a *App) syncOnce(ctx context.Context) error {
 			}
 			a.stage(ctx, fmt.Sprintf("MDBList %s batch enrichment %d/%d", kind, end, len(ids)))
 			if e = a.pace(ctx); e != nil {
-				return e
+				return result, e
 			}
 			raws, e := a.client(s).MDBBatch(ctx, "tmdb", kind, ids[offset:end])
 			if e != nil {
-				return e
+				return result, e
 			}
 			requested := map[string]bool{}
 			for _, id := range ids[offset:end] {
@@ -720,7 +807,7 @@ func (a *App) syncOnce(ctx context.Context) error {
 					}
 				}
 				if _, e = a.saveReleaseSource(ctx, r, people, source); e != nil {
-					return e
+					return result, e
 				}
 			}
 			if len(returned) < len(requested) {
@@ -736,17 +823,47 @@ func (a *App) syncOnce(ctx context.Context) error {
 		}
 	}
 	a.stage(ctx, "Enriching queued or stale local person biography cards")
-	people, e := a.actresses(ctx, "", "")
-	if e != nil {
-		return e
+	var total int
+	if e = a.db.QueryRow(ctx, `SELECT count(*) FROM actresses`).Scan(&total); e != nil {
+		return result, e
 	}
-	for _, p := range people {
-		if strings.HasPrefix(p.MetadataStatus, "pending") || time.Since(p.UpdatedAt) > 7*24*time.Hour {
-			p = a.enrichPerson(ctx, s, p)
-			if _, e = a.savePersonMetadata(ctx, p); e != nil {
-				return e
-			}
+	attempted, partial, unavailable, skipped, processed := 0, 0, 0, 0, 0
+	var after int64
+	for {
+		people, err := a.syncBiographyPage(ctx, after)
+		if err != nil {
+			return result, err
 		}
+		if len(people) == 0 {
+			break
+		}
+		for _, p := range people {
+			if err := ctx.Err(); err != nil {
+				return result, err
+			}
+			after = p.ID
+			if strings.HasPrefix(p.MetadataStatus, "pending") || time.Since(p.UpdatedAt) > 7*24*time.Hour {
+				p = a.enrichPerson(ctx, s, p)
+				if _, e = a.savePersonMetadata(ctx, p); e != nil {
+					return result, e
+				}
+				attempted++
+			} else {
+				skipped++
+			}
+			if strings.HasPrefix(p.MetadataStatus, "unavailable:") {
+				unavailable++
+			}
+			if strings.HasPrefix(p.MetadataStatus, "partial:") || (strings.HasPrefix(p.MetadataStatus, "ok") && (strings.TrimSpace(p.Biography) == "" || strings.TrimSpace(p.Profile) == "" || strings.TrimSpace(p.Birthday) == "" || strings.TrimSpace(p.PlaceOfBirth) == "")) {
+				partial++
+			}
+			processed++
+		}
+		a.stage(ctx, fmt.Sprintf("Biography cards processed %d/%d; %d attempted, %d not due; %d partial, %d unavailable (not complete filmographies)", processed, total, attempted, skipped, partial, unavailable))
+	}
+
+	if partial > 0 || unavailable > 0 || failureCount > 0 {
+		summary = fmt.Sprintf("Sync processed %d/%d biography cards; %d attempted, %d not due; %d partial, %d unavailable; %d title metadata gaps. Prior data retained; no complete filmography claimed", processed, total, attempted, skipped, partial, unavailable, failureCount)
 	}
 	if failureCount > 0 {
 		a.activity(ctx, "metadata", fmt.Sprintf("%d metadata records incomplete or unavailable; prior data retained, no cast inferred", failureCount), "warning")
@@ -757,7 +874,7 @@ func (a *App) syncOnce(ctx context.Context) error {
 	a.stage(ctx, "Refreshing configured Sonarr/Radarr inventories (read-only)")
 	if err := a.syncArr(ctx); err != nil {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return result, ctx.Err()
 		}
 		a.activity(ctx, "arr", "Read-only inventory sync incomplete; prior availability retained: "+providerError(err), "warning")
 	}
@@ -765,17 +882,17 @@ func (a *App) syncOnce(ctx context.Context) error {
 	// Discovery may take hours. Re-read global consent/config after network work.
 	s, e = a.settings(ctx)
 	if e != nil {
-		return e
+		return result, e
 	}
 	if e = a.automate(ctx, s, !baseline); e != nil {
-		return e
+		return result, e
 	}
 	if !baseline {
 		_, e = a.db.Exec(ctx, `INSERT INTO app_state(key,value) VALUES('baseline','true') ON CONFLICT DO NOTHING`)
 		if e != nil {
-			return e
+			return result, e
 		}
 		a.activity(ctx, "automation", "Initial baseline persisted silently; no historic acquisition or notification sent", "ok")
 	}
-	return nil
+	return result, nil
 }

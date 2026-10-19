@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -567,6 +568,10 @@ func (a *App) runDueSchedules(ctx context.Context) {
 	}
 }
 func (a *App) executeSchedule(parent context.Context, claim *scheduleClaim) {
+	a.executeScheduleWithSync(parent, claim, a.syncOnceResult)
+}
+
+func (a *App) executeScheduleWithSync(parent context.Context, claim *scheduleClaim, syncRun func(context.Context) (syncCompletion, error)) {
 	defer claim.release()
 	ctx, cancel := context.WithTimeout(parent, 6*time.Hour)
 	defer cancel()
@@ -596,9 +601,10 @@ func (a *App) executeSchedule(parent context.Context, claim *scheduleClaim) {
 		}
 	}()
 	var runErr error
+	var completion syncCompletion
 	switch claim.task.Type {
 	case "catalog_sync":
-		runErr = a.syncOnce(ctx)
+		completion, runErr = syncRun(ctx)
 	case "silo_sync":
 		runErr = a.syncSilo(ctx)
 	case "arr_sync":
@@ -611,6 +617,9 @@ func (a *App) executeSchedule(parent context.Context, claim *scheduleClaim) {
 	close(heartbeatStop)
 	<-heartbeatDone
 	status, message := "ok", ""
+	if claim.task.Type == "catalog_sync" && runErr == nil && completion.Status == "warning" {
+		status, message = completion.Status, completion.Message
+	}
 	if runErr != nil {
 		status = "error"
 		message = providerError(runErr)
@@ -628,7 +637,9 @@ func (a *App) executeSchedule(parent context.Context, claim *scheduleClaim) {
 	}
 	save, done := context.WithTimeout(context.WithoutCancel(parent), 5*time.Second)
 	defer done()
-	_, _ = claim.conn.Exec(save, `UPDATE scheduled_tasks SET last_status=$2,last_error=$3,next_run=$4,updated_at=now() WHERE id=$1`, claim.task.ID, status, message, next)
+	if _, err := claim.conn.Exec(save, `UPDATE scheduled_tasks SET last_status=$2,last_error=$3,next_run=$4,updated_at=now() WHERE id=$1`, claim.task.ID, status, message, next); err != nil {
+		log.Printf("persist scheduled task completion (task %d): %v", claim.task.ID, err)
+	}
 }
 
 // search_missing is a bounded search of existing, exact-ID-matched manager

@@ -594,6 +594,33 @@ test('release details label supplied MDBList title links beside provider links w
 });
 
 
+test('watch and cast details separate MDBList biography from incomplete discovery without retired-provider promotions or jobs',async()=>{
+  const person={...actress(),biography:'Factual MDBList biography.',metadata_status:'ok: MDBList biography | Supplemental TVMaze credits unavailable: historical outage'};
+  const {page,requests,errors}=await app({withRelease:true,hash:'#/actresses',handle:({path})=>{
+    if(path==='/api/actresses/2')return {data:{actress:person,releases:[],total:0}};
+    if(path==='/api/releases/1/cast')return {data:{items:[person],coverage:'Verified cached cast'}};
+    if(path==='/api/people/123456')return {data:{person,releases:[]}};
+  }});
+  try {
+    await page.locator('.actress-card [data-action=actress]').first().click();
+    let dialog=page.getByRole('dialog',{name:'Actress watch',exact:true});
+    await dialog.getByText('Factual MDBList biography.',{exact:true}).waitFor();
+    for(const label of ['MDBList biography status','Discovery coverage'])assert.ok((await dialog.innerText()).toLowerCase().includes(label.toLowerCase()),await dialog.innerText());
+    assert.match(await dialog.innerText(),/0 known matches does not mean no releases/i);
+    assert.doesNotMatch(await dialog.innerText(),/tvmaze|historical outage|supplemental credits/i);
+    assert.equal(await dialog.locator('a[href*="tvmaze"]').count(),0);
+    assert.equal(await dialog.getByRole('button',{name:'Add matched releases',exact:true}).isDisabled(),true);
+    await page.keyboard.press('Escape');await page.goto(origin+'#/release/1');await page.locator('[data-action=person]').first().click();
+    dialog=page.getByRole('dialog',{name:'Person details',exact:true});
+    await dialog.getByText('Factual MDBList biography.',{exact:true}).waitFor();
+    assert.match(await dialog.innerText(),/Discovery coverage/);
+    assert.match(await dialog.innerText(),/0 known matches does not mean no releases/i);
+    assert.doesNotMatch(await dialog.innerText(),/tvmaze|historical outage/i);
+    assert.equal(requests.some(r=>/credits|discovery/.test(r.path)||r.method!=='GET'),false);
+    assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
 test('watch and cast details omit ages for missing invalid and future birthdays',async()=>{
   for(const birthday of [undefined,'2026-02-29','2999-01-01']) {
     const person={...actress(),birthday};

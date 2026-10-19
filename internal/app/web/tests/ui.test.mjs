@@ -2,6 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { ageYears, escapeHTML, artworkURL, releaseWindow, parsePersonIdentity, acquisitionTarget, calendarCells, buildSettingsPayload, normalizeSearchRow, settingsMatch, bulkScope, summarizeBulkResult } from '../app.js';
 
+test('current person metadata strips only retired credit diagnostics and preserves MDBList identity warnings', async () => {
+  const { currentPersonMetadataStatus } = await import('../app.js');
+  assert.equal(typeof currentPersonMetadataStatus,'function');
+  assert.equal(currentPersonMetadataStatus('ok: MDBList biography | Supplemental TVMaze credits unavailable: old outage'),'ok: MDBList biography');
+  assert.equal(currentPersonMetadataStatus('unavailable: identity mismatch | Supplemental TVMaze credits unavailable'),'unavailable: identity mismatch');
+  assert.equal(currentPersonMetadataStatus('Supplemental TVMaze credits unavailable'),'Unknown / not enriched');
+  assert.equal(currentPersonMetadataStatus(undefined),'Unknown / not enriched');
+});
+
 test('artwork is always sent through allowlisted HTTPS proxy', () => {
   assert.equal(artworkURL('https://image.tmdb.org/t/p/w500/a.jpg'), '/api/artwork?url=https%3A%2F%2Fimage.tmdb.org%2Ft%2Fp%2Fw500%2Fa.jpg');
   for (const unsafe of ['javascript:alert(1)', 'http://image.tmdb.org/a', 'https://image.tmdb.org.evil/a', 'https://127.0.0.1/a', 'https://a:b@image.tmdb.org/a', 'https://image.tmdb.org:444/a', '', '/private']) assert.equal(artworkURL(unsafe), '');

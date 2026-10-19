@@ -112,6 +112,7 @@ func (a *App) personDetail(w http.ResponseWriter, req *http.Request) {
 		fail(w, 500, "cannot load person releases")
 		return
 	}
+	p.MetadataStatus = currentPersonMetadataStatus(p.MetadataStatus)
 	respond(w, 200, map[string]any{"person": p, "releases": releases})
 }
 func (a *App) releasesForPerson(ctx context.Context, id string) ([]Release, error) {
