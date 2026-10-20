@@ -145,6 +145,12 @@ func (a *App) saveRelease(ctx context.Context, r Release, people []string) (Rele
 	return a.saveReleaseSource(ctx, r, people, "mdblist:cast")
 }
 func (a *App) saveReleaseSource(ctx context.Context, r Release, people []string, source string) (Release, error) {
+	return a.saveReleaseCredit(ctx, r, people, source, "", "")
+}
+
+// saveReleaseCredit reconciles metadata and cast under the existing identity lock.
+// Supplemental discovery must commit its silent baseline with the title itself.
+func (a *App) saveReleaseCredit(ctx context.Context, r Release, people []string, source, creditPerson, creditSource string) (Release, error) {
 	tx, e := a.db.Begin(ctx)
 	if e != nil {
 		return r, e
@@ -153,6 +159,10 @@ func (a *App) saveReleaseSource(ctx context.Context, r Release, people []string,
 	// Serialize canonical identity reconciliation across discovery workers.
 	if _, e = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(486722120)`); e != nil {
 		return r, e
+	}
+	if creditPerson != "" {
+		r.SourceLinks = append(r.SourceLinks, creditSource)
+		r.Coverage = coverageWithSourceWarnings(r.Coverage, "MDBList title metadata; verified TMDb person combined cast credits (not crew); bounded discovery, no complete filmography claimed.")
 	}
 	canonical := r.Type + ":imdb:" + r.IMDbID
 	if r.TMDbID != "" {
@@ -165,7 +175,8 @@ func (a *App) saveReleaseSource(ctx context.Context, r Release, people []string,
 	var id int64
 	var previous []byte
 	e = tx.QueryRow(ctx, `SELECT id,data FROM releases WHERE media_type=$1 AND (($2<>'' AND tmdb_id=$2) OR ($3<>'' AND imdb_id=$3)) LIMIT 1 FOR UPDATE`, r.Type, r.TMDbID, r.IMDbID).Scan(&id, &previous)
-	if e == pgx.ErrNoRows {
+	created := e == pgx.ErrNoRows
+	if created {
 		e = tx.QueryRow(ctx, `INSERT INTO releases(canonical_key,media_type,tmdb_id,imdb_id,data) VALUES($1,$2,$3,$4,$5) RETURNING id`, canonical, r.Type, r.TMDbID, r.IMDbID, b).Scan(&id)
 	} else if e == nil {
 		var old Release
@@ -209,6 +220,18 @@ func (a *App) saveReleaseSource(ctx context.Context, r Release, people []string,
 		_, e = tx.Exec(ctx, `INSERT INTO release_cast(release_id,tmdb_id,source,data) VALUES($1,$2,$3,$4) ON CONFLICT(release_id,tmdb_id) DO UPDATE SET data=release_cast.data||excluded.data`, id, person, source, data)
 		if e != nil {
 			return r, e
+		}
+	}
+	if creditPerson != "" {
+		if _, e = tx.Exec(ctx, `INSERT INTO release_cast(release_id,tmdb_id,source,data) VALUES($1,$2,$3,'{}') ON CONFLICT DO NOTHING`, id, creditPerson, "tmdb:person_cast:"+creditSource); e != nil {
+			return r, e
+		}
+		// Existing primary titles retain their eligibility; future material events
+		// must not be swallowed by supplemental discovery of an upcoming title.
+		if created {
+			if _, e = tx.Exec(ctx, `INSERT INTO actions(release_id,kind,status,event_key) SELECT $1,k,'baseline',$2 FROM unnest(ARRAY['acquire','notify']) k ON CONFLICT DO NOTHING`, id, releaseEvent(r, time.Now().UTC())); e != nil {
+				return r, e
+			}
 		}
 	}
 	_, e = tx.Exec(ctx, `INSERT INTO release_people(release_id,actress_id,source) SELECT rc.release_id,p.id,rc.source FROM release_cast rc JOIN actresses p ON p.tmdb_id=rc.tmdb_id WHERE rc.release_id=$1 AND COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%' ON CONFLICT DO NOTHING`, id)

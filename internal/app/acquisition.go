@@ -39,6 +39,8 @@ func (a *App) testIntegration(w http.ResponseWriter, r *http.Request) {
 	}
 	kind := r.PathValue("kind")
 	switch kind {
+	case "tmdb":
+		e = a.testTMDB(r.Context(), s)
 	case "radarr", "sonarr":
 		_, e = a.client(s).ArrOptions(r.Context(), kind)
 	case "pushover":

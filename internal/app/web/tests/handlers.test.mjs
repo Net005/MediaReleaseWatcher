@@ -6,7 +6,7 @@ import { chromium } from '@playwright/test';
 
 let browser, server, origin;
 const assets = new Map(await Promise.all(['index.html','app.js','styles.css'].map(async name => [name, await readFile(new URL('../'+name, import.meta.url),'utf8')])));
-const defaults = () => ({silo:{url:'',configured:false,enabled:false},mdblist:{configured:false,list_ids:'',sync_interval_minutes:360},sonarr:{url:'',configured:false,quality_profile_id:0,root_folder:'',enabled:false,search:false},radarr:{url:'',configured:false,quality_profile_id:0,root_folder:'',enabled:false,search:false},pushover:{configured:false,enabled:false,device:''},automation:{enabled:false,notify_first_sync:false},public_url:''});
+const defaults = () => ({tmdb:{enabled:false,configured:false},silo:{url:'',configured:false,enabled:false},mdblist:{configured:false,list_ids:'',sync_interval_minutes:360},sonarr:{url:'',configured:false,quality_profile_id:0,root_folder:'',enabled:false,search:false},radarr:{url:'',configured:false,quality_profile_id:0,root_folder:'',enabled:false,search:false},pushover:{configured:false,enabled:false,device:''},automation:{enabled:false,notify_first_sync:false},public_url:''});
 const release = () => ({id:1,title:'Handler test title',type:'movie',year:2026,tmdb_id:'654321',imdb_id:'tt7654321',description:'Test-only metadata.',genres:['Drama'],release_date:'2026-01-01',monitored:false,actresses:[],acquisition:{},content_info:{advisory:'Source supplied'},ratings:[],watch_providers:[]});
 const actress = () => ({id:2,name:'Handler test watch',tmdb_id:'123456',group:'',monitored:true,auto_add:false,notify:false,release_count:1,upcoming_count:0,metadata_status:'unknown'});
 
@@ -41,7 +41,7 @@ async function app({authenticated=true,needsSetup=false,withRelease=false,config
     else if(path==='/api/login'||path==='/api/setup'){authenticated=true;needsSetup=false;data={authenticated:true};}
     else if(path==='/api/logout')authenticated=false;
     else if(path==='/api/dashboard')data={stats:{releases:withRelease?1:0,actresses:1,upcoming:0,current:0,past:withRelease?1:0,monitored:0},featured:[],upcoming:[],recent:[],activity:[],sync:{running:false}};
-    else if(path==='/api/settings'){if(method==='PUT'){const old=settings;settings=structuredClone(body);for(const kind of ['mdblist','sonarr','radarr','pushover','silo']){settings[kind].configured=old[kind].configured||Boolean(body[kind].api_key||body[kind].token);delete settings[kind].api_key;delete settings[kind].token;delete settings[kind].user;}}data=settings;}
+    else if(path==='/api/settings'){if(method==='PUT'){const old=settings;settings=structuredClone(body);for(const kind of ['mdblist','sonarr','radarr','pushover','silo','tmdb']){settings[kind].configured=old[kind].configured||Boolean(body[kind].api_key||body[kind].token);delete settings[kind].api_key;delete settings[kind].token;delete settings[kind].user;}}data=settings;}
     else if(path==='/api/releases')data=method==='POST'?(withRelease=true,item):{items:withRelease?[item]:[],total:withRelease?1:0,page:Number(url.searchParams.get('page')||1),limit:Number(url.searchParams.get('limit')||36)};
     else if(path==='/api/releases/1'){if(method==='PATCH')item={...item,...body};data=item;}
     else if(path==='/api/releases/1/acquire'){item.acquisition.radarr='added';data={ok:true,result:{id:11,already_exists:false,url:'http://arr.test/movie/11'}};}
@@ -636,4 +636,41 @@ test('watch and cast details omit ages for missing invalid and future birthdays'
       await page.locator('.birthday-fact').waitFor();assert.equal(await page.locator('.birthday-fact .badge').count(),0);
     }finally{await page.close();}
   }
+});
+
+ test('TMDb fallback saves explicit opt-in while preserving blank saved secret on mobile',async()=>{
+  const {page,requests}=await app({hash:'#/settings'});
+  try {
+    await page.setViewportSize({width:375,height:812});
+    const card=page.locator('#settings-tmdb');await card.waitFor();
+    assert.match(await card.innerText(),/Not configured/);
+    const key=card.locator('[name="tmdb.api_key"]');assert.equal(await key.getAttribute('type'),'password');
+    const link=card.getByRole('link',{name:'Get a TMDb API key'});assert.equal(await link.getAttribute('href'),'https://www.themoviedb.org/settings/api');assert.equal(await link.getAttribute('target'),'_blank');assert.match(await link.getAttribute('rel'),/noopener/);
+    await card.locator('[name="tmdb.enabled"]').check();
+    await page.getByRole('button',{name:'Save settings',exact:true}).click();await page.getByText('Settings saved and verified.',{exact:true}).waitFor();
+    assert.deepEqual(requests.filter(r=>r.path==='/api/settings'&&r.method==='PUT').at(-1).body.tmdb,{enabled:true});
+    await page.locator('#toasts').evaluate(node=>node.replaceChildren());await key.fill('fixture-secret');await page.getByRole('button',{name:'Save settings',exact:true}).click();await card.locator('.configured:not(.unconfigured)').waitFor();assert.equal(await key.inputValue(),'');
+    await page.locator('#toasts').evaluate(node=>node.replaceChildren());await card.locator('[name="tmdb.enabled"]').uncheck();await page.getByRole('button',{name:'Save settings',exact:true}).click();await page.getByText('Settings saved and verified.',{exact:true}).waitFor();assert.deepEqual(requests.filter(r=>r.path==='/api/settings'&&r.method==='PUT').at(-1).body.tmdb,{enabled:false});assert.match(await card.innerText(),/Configured/);
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+    assert.equal(await page.evaluate(()=>JSON.stringify(localStorage)+JSON.stringify(sessionStorage)).then(s=>s.includes('fixture-secret')),false);
+  }finally{await page.close();}
+});
+
+test('TMDb connection tests only saved credentials and honestly reports rejected tests',async()=>{
+  let result={ok:true};
+  const {page,requests}=await app({hash:'#/settings',handle:({path})=>path==='/api/integrations/tmdb/test'?{data:result}:undefined});
+  try {
+    const card=page.locator('#settings-tmdb');await card.waitFor();
+    await card.getByRole('button',{name:'Test connection',exact:true}).click();await card.getByText('Connection verified.',{exact:true}).waitFor();
+    assert.deepEqual(requests.find(r=>r.path==='/api/integrations/tmdb/test'),{path:'/api/integrations/tmdb/test',method:'POST',body:{},query:{}});
+    result={ok:false};await card.getByRole('button',{name:'Test connection',exact:true}).click();await card.getByText('The server did not confirm a successful test.',{exact:true}).waitFor();
+    await card.locator('[name="tmdb.api_key"]').fill('unsaved-fixture');await card.getByRole('button',{name:'Test connection',exact:true}).click();assert.equal(requests.filter(r=>r.path==='/api/integrations/tmdb/test').length,2);
+    assert.equal(requests.some(r=>JSON.stringify(r.query).includes('unsaved-fixture')),false);
+    assert.doesNotMatch(await card.innerText(),/TVmaze/);
+  }finally{await page.close();}
+});
+
+test('watch coverage describes optional TMDb fallback without retired television provider',async()=>{
+  const {page}=await app({hash:'#/actresses'});
+  try {await page.locator('.actress-card').waitFor();const text=await page.locator('#main').innerText();assert.doesNotMatch(text,/TVmaze/i);assert.match(text,/TMDb/);assert.match(text,/incomplete/);}finally{await page.close();}
 });

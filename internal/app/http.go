@@ -325,6 +325,9 @@ func (a *App) putSettings(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &s) {
 		return
 	}
+	if s.TMDB.APIKey == "" {
+		s.TMDB.APIKey = old.TMDB.APIKey
+	}
 	if s.MDBList.APIKey == "" {
 		s.MDBList.APIKey = old.MDBList.APIKey
 	}

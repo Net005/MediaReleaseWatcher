@@ -69,7 +69,7 @@ func (a *App) fetchRelease(ctx context.Context, s Settings, provider, kind, id s
 	if (provider == "tmdb" && r.TMDbID != id) || (provider == "imdb" && r.IMDbID != id) {
 		return Release{}, errors.New("metadata identity does not match requested literal ID")
 	}
-	if len(people) == 0 && a.cfg.TMDBAPIKey != "" {
+	if len(people) == 0 && s.TMDB.Enabled && s.TMDB.APIKey != "" {
 		people, e = a.tmdbCast(ctx, &r)
 		if e != nil {
 			a.activity(ctx, "metadata", "Optional TMDb credits fallback failed; no inferred cast", "warning")
@@ -119,7 +119,24 @@ func providerError(e error) string {
 	}
 	return "provider operation failed; check integration configuration or activity"
 }
-func (a *App) enrichPerson(ctx context.Context, s Settings, p Actress) Actress {
+func (a *App) enrichPerson(ctx context.Context, s Settings, p Actress) (result Actress) {
+	defer func() {
+		if !s.TMDB.Enabled || s.TMDB.APIKey == "" || strings.HasPrefix(result.MetadataStatus, "unavailable: identity mismatch") {
+			return
+		}
+		if result.Profile != "" && result.Biography != "" && result.Birthday != "" && result.PlaceOfBirth != "" {
+			return
+		}
+		got, err := a.tmdbPerson(ctx, s, result)
+		if err == nil {
+			result = got
+		} else {
+			result.MetadataStatus += " | TMDb person fallback unavailable; prior fields retained"
+		}
+	}()
+	if strings.HasPrefix(p.MetadataStatus, "unavailable: identity mismatch") {
+		return p
+	}
 	raw, e := a.mdb(ctx, s, "/people/"+p.TMDbID, nil)
 	if e != nil {
 		if strings.HasPrefix(p.MetadataStatus, "unavailable: identity mismatch") {
@@ -498,22 +515,28 @@ func (a *App) stage(ctx context.Context, s string) {
 func (a *App) startSync() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.syncState.Running || a.ctx.Err() != nil {
+	if a.manualSyncRunning || a.syncState.Running || a.ctx.Err() != nil {
 		return false
 	}
-	a.syncState.Running = true
-	a.syncState.Stage = "starting"
+	// Launch ownership outlives public progress: completion publishes Running=false
+	// before final persistence and advisory unlock have returned.
+	a.manualSyncRunning = true
+	before := a.syncState
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer func() {
+			a.mu.Lock()
+			a.manualSyncRunning = false
+			a.mu.Unlock()
+		}()
 		ctx, cancel := context.WithTimeout(a.ctx, 6*time.Hour)
 		defer cancel()
 		if err := a.syncOnce(ctx); err != nil {
-			// A rejected lease never owns persisted state. Clear only our local
-			// reservation, not another worker's running/progress state.
+			// Pre-lease failures own no progress. Report them only if no owner
+			// has published progress since launch; never clear another run.
 			a.mu.Lock()
-			if a.syncState.Stage == "starting" && a.syncState.Running {
-				a.syncState.Running = false
+			if a.syncState == before {
 				a.syncState.Stage = "failed"
 				a.syncState.LastError = providerError(err)
 			}
@@ -797,7 +820,7 @@ func (a *App) syncOnceResult(ctx context.Context) (result syncCompletion, runErr
 				r.MetadataFetchedAt = time.Now().UTC()
 				returned[r.TMDbID] = true
 				source := "mdblist:cast"
-				if len(people) == 0 && a.cfg.TMDBAPIKey != "" {
+				if len(people) == 0 && s.TMDB.Enabled && s.TMDB.APIKey != "" {
 					people, e = a.tmdbCast(ctx, &r)
 					if e != nil {
 						failureCount++
@@ -842,7 +865,7 @@ func (a *App) syncOnceResult(ctx context.Context) (result syncCompletion, runErr
 				return result, err
 			}
 			after = p.ID
-			if strings.HasPrefix(p.MetadataStatus, "pending") || time.Since(p.UpdatedAt) > 7*24*time.Hour {
+			if strings.HasPrefix(p.MetadataStatus, "pending") || time.Since(p.UpdatedAt) > 7*24*time.Hour || (s.TMDB.Enabled && s.TMDB.APIKey != "" && !strings.HasPrefix(p.MetadataStatus, "unavailable: identity mismatch") && (strings.TrimSpace(p.Profile) == "" || strings.TrimSpace(p.Biography) == "" || strings.TrimSpace(p.Birthday) == "" || strings.TrimSpace(p.PlaceOfBirth) == "")) {
 				p = a.enrichPerson(ctx, s, p)
 				if _, e = a.savePersonMetadata(ctx, p); e != nil {
 					return result, e
@@ -870,6 +893,17 @@ func (a *App) syncOnceResult(ctx context.Context) (result syncCompletion, runErr
 		// Discovery IDs were fully persisted; omissions here are optional per-title
 		// enrichment gaps, not incomplete source pagination. Baseline all known IDs
 		// silently so permanently unavailable metadata cannot block the whole app.
+	}
+	a.stage(ctx, "Bounded TMDb actor-credit discovery (4 actors, 40 title resolutions maximum)")
+	pendingCredits, creditErr := a.syncTMDBCredits(ctx, s)
+	if creditErr != nil {
+		return result, creditErr
+	}
+	if pendingCredits > 0 {
+		if summary != "" {
+			summary += "; "
+		}
+		summary += fmt.Sprintf("%d actors have pending TMDb credit discovery; durable continuation saved for next sync; no complete filmography claimed", pendingCredits)
 	}
 	a.stage(ctx, "Refreshing configured Sonarr/Radarr inventories (read-only)")
 	if err := a.syncArr(ctx); err != nil {

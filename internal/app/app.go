@@ -19,7 +19,7 @@ import (
 //go:embed migrations/*.sql
 var migrations embed.FS
 
-type Config struct{ DatabaseURL, Secret, DataDir, MDBListAPIKey, MDBListBaseURL, TMDBAPIKey, PublicURL string }
+type Config struct{ DatabaseURL, Secret, DataDir, MDBListAPIKey, MDBListBaseURL, TMDBAPIKey, TMDBBaseURL, PublicURL string }
 type App struct {
 	db             *pgxpool.Pool
 	cipher         cipher.AEAD
@@ -37,6 +37,8 @@ type App struct {
 	clientMu       sync.Mutex
 	clientConfig   string
 	providerClient *integrations.Client
+
+	manualSyncRunning bool // guarded by mu; held through syncOnce's deferred cleanup
 }
 type SyncState struct {
 	Running   bool       `json:"running"`

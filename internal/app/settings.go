@@ -9,6 +9,12 @@ import (
 	"strings"
 )
 
+type TMDBSettings struct {
+	Enabled    bool   `json:"enabled"`
+	APIKey     string `json:"api_key,omitempty"`
+	Configured bool   `json:"configured"`
+}
+
 type SiloSettings struct {
 	URL        string `json:"url"`
 	Configured bool   `json:"configured"`
@@ -50,6 +56,7 @@ type AutomationSettings struct {
 	NotifyFirstSync bool `json:"notify_first_sync"`
 }
 type Settings struct {
+	TMDB       TMDBSettings       `json:"tmdb"`
 	Silo       SiloSettings       `json:"silo"`
 	MDBList    MDBSettings        `json:"mdblist"`
 	Sonarr     ArrSettings        `json:"sonarr"`
@@ -59,8 +66,12 @@ type Settings struct {
 	PublicURL  string             `json:"public_url"`
 }
 
-func defaultSettings() Settings { return Settings{MDBList: MDBSettings{SyncIntervalMinutes: 360}} }
+func defaultSettings() Settings {
+	return Settings{TMDB: TMDBSettings{Enabled: true}, MDBList: MDBSettings{SyncIntervalMinutes: 360}}
+}
 func (s Settings) public() Settings {
+	s.TMDB.Configured = s.TMDB.APIKey != ""
+	s.TMDB.APIKey = ""
 	s.Silo.Configured = s.Silo.URL != "" && s.Silo.APIKey != ""
 	s.Silo.APIKey = ""
 	s.MDBList.Lists = configuredLists(s.MDBList)
@@ -82,6 +93,7 @@ func (a *App) settings(ctx context.Context) (Settings, error) {
 	e := a.db.QueryRow(ctx, `SELECT encrypted FROM settings WHERE id=1`).Scan(&b)
 	if e == pgx.ErrNoRows {
 		s.MDBList.APIKey = a.cfg.MDBListAPIKey
+		s.TMDB.APIKey = a.cfg.TMDBAPIKey
 		s.PublicURL = a.cfg.PublicURL
 		return s, nil
 	}
@@ -93,6 +105,9 @@ func (a *App) settings(ctx context.Context) (Settings, error) {
 		return s, errors.New("cannot decrypt settings: check APP_SECRET")
 	}
 	e = json.Unmarshal(b, &s)
+	if s.TMDB.Enabled && s.TMDB.APIKey == "" {
+		s.TMDB.APIKey = a.cfg.TMDBAPIKey
+	}
 	s.MDBList.Lists = configuredLists(s.MDBList)
 	return s, e
 }
