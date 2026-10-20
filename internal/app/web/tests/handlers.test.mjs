@@ -59,6 +59,37 @@ async function app({authenticated=true,needsSetup=false,withRelease=false,config
   return {page,requests,errors};
 }
 
+for (const kind of ['actress','person']) test(`${kind} details sort the complete known releases newest first with unknown dates last and deterministic ties`,async()=>{
+  const entries=[
+    {id:9,title:'Unknown',release_date:''},
+    {id:8,title:'Old',release_date:'2000-01-01',created_at:'2099-01-01'},
+    {id:7,title:'Zulu',release_date:'2030-03-01'},
+    {id:6,title:'Alpha',release_date:'2030-03-01'},
+    {id:5,title:'Alpha',release_date:'2030-03-01'},
+    {id:4,title:'Broken',release_date:'not-a-date'},
+    {id:3,title:'Impossible',release_date:'2031-02-29'},
+    {id:2,title:'Latest',release_date:'2090-01-01'},
+    {id:1,title:'Missing'}
+  ].map(value=>({...release(),...value,release_date:value.release_date}));
+  const {page,errors}=await app({hash:'#/actresses',handle:({path})=>{
+    if(path==='/api/actresses/2')return {data:{actress:actress(),releases:entries,total:entries.length}};
+    if(path==='/api/releases/1/cast')return {data:{items:[{tmdb_id:'123456',name:actress().name}],coverage:'Test coverage'}};
+    if(path==='/api/people/123456')return {data:{person:actress(),releases:entries}};
+  }});
+  try {
+    await page.locator('.actress-card').waitFor();
+    if(kind==='actress')await page.locator('.actress-card [data-action=actress]').first().click();
+    else {
+      await page.evaluate(()=>{location.hash='#/release/1';});
+      await page.getByRole('button',{name:'View person Handler test watch',exact:true}).click();
+    }
+    const cards=page.locator('dialog .release-card .cover-link');await cards.last().waitFor();
+    assert.deepEqual(await cards.evaluateAll(nodes=>nodes.map(node=>Number(node.dataset.id))),[2,5,6,7,8,4,3,1,9]);
+    await page.locator('dialog').getByText('Release date: newest first',{exact:true}).waitFor();
+    assert.deepEqual(errors,[]);
+  }finally{await page.close();}
+});
+
 test('actress upcoming-only filter uses the API, persists across navigation and never narrows group cache',async()=>{
   const {page,requests,errors}=await app({hash:'#/actresses',handle:({path,query})=>path==='/api/actresses'?{data:{items:query.upcoming_only==='true'?[]:[actress(),{...actress(),id:3,tmdb_id:'123457',group:'Synthetic group'}],total:query.upcoming_only==='true'?0:2}}:undefined});
   try {
