@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -114,11 +115,57 @@ func providerError(e error) string {
 		return "provider request canceled or timed out"
 	}
 	s := e.Error()
+	if s == "sonarr response exceeds size limit" || s == "radarr response exceeds size limit" {
+		return s
+	}
 	if strings.Contains(s, "configured") || strings.Contains(s, "metadata") || strings.Contains(s, "literal") {
 		return s
 	}
 	return "provider operation failed; check integration configuration or activity"
 }
+
+// Person attempts have their own clock: preference edits must not postpone retries,
+// and a successful but sparse upstream response must not cause a request each sync.
+const personBiographyRetryInterval = 24 * time.Hour
+
+func (a *App) refreshPersonBiography(ctx context.Context, s Settings, p Actress) (Actress, bool, error) {
+	if strings.HasPrefix(p.MetadataStatus, "unavailable: identity mismatch") {
+		return p, false, nil
+	}
+	sparse := strings.TrimSpace(p.Profile) == "" || strings.TrimSpace(p.Biography) == "" || strings.TrimSpace(p.Birthday) == "" || strings.TrimSpace(p.PlaceOfBirth) == ""
+	// Hash the complete provider configuration, never persist credentials themselves.
+	config, _ := json.Marshal([]any{s.MDBList.APIKey, a.cfg.MDBListBaseURL, s.TMDB.Enabled, s.TMDB.APIKey, a.cfg.TMDBBaseURL})
+	key := fmt.Sprintf("person:biography:%s:%x", p.TMDbID, sha256.Sum256(config))
+	var raw []byte
+	err := a.db.QueryRow(ctx, `SELECT value FROM app_state WHERE key=$1`, key).Scan(&raw)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return p, false, err
+	}
+	if err == nil {
+		var state struct {
+			Attempted time.Time `json:"attempted"`
+		}
+		if err = json.Unmarshal(raw, &state); err != nil {
+			return p, false, err
+		}
+		interval := personBiographyRetryInterval
+		if !sparse && !strings.HasPrefix(p.MetadataStatus, "unavailable:") {
+			interval = 7 * 24 * time.Hour
+		}
+		if time.Since(state.Attempted) < interval {
+			return p, false, nil
+		}
+	} else if !strings.HasPrefix(p.MetadataStatus, "pending") && time.Since(p.UpdatedAt) <= 7*24*time.Hour && !(s.TMDB.Enabled && s.TMDB.APIKey != "" && sparse) {
+		return p, false, nil
+	}
+	// Persist before HTTP: a failed durable write must not launch uncached work.
+	state, _ := json.Marshal(map[string]time.Time{"attempted": time.Now().UTC()})
+	if _, err = a.db.Exec(ctx, `INSERT INTO app_state(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, state); err != nil {
+		return p, false, err
+	}
+	return a.enrichPerson(ctx, s, p), true, nil
+}
+
 func (a *App) enrichPerson(ctx context.Context, s Settings, p Actress) (result Actress) {
 	defer func() {
 		if !s.TMDB.Enabled || s.TMDB.APIKey == "" || strings.HasPrefix(result.MetadataStatus, "unavailable: identity mismatch") {
@@ -230,6 +277,7 @@ func (a *App) addActress(w http.ResponseWriter, r *http.Request) {
 		fail(w, 500, "cannot save actress")
 		return
 	}
+	a.wakeCreditCatchup()
 	a.activity(r.Context(), "watcher", "Added local actress watcher; MDBList favorites unchanged", "ok")
 	respond(w, 201, p)
 }
@@ -332,6 +380,9 @@ func (a *App) importActresses(w http.ResponseWriter, r *http.Request) {
 		if p.ID == 0 {
 			b, _ = json.Marshal(p)
 			e = tx.QueryRow(ctx, `INSERT INTO actresses(tmdb_id,data) VALUES($1,$2) RETURNING id`, p.TMDbID, b).Scan(&p.ID)
+			if e == nil {
+				_, e = tx.Exec(ctx, `INSERT INTO app_state(key,value) VALUES('credit_catchup:'||$1::bigint::text,'{}') ON CONFLICT DO NOTHING`, p.ID)
+			}
 		} else {
 			updates := map[string]any{}
 			if v.AutoAdd != nil {
@@ -366,6 +417,9 @@ func (a *App) importActresses(w http.ResponseWriter, r *http.Request) {
 	if e != nil {
 		fail(w, 500, "import rolled back")
 		return
+	}
+	if added > 0 {
+		a.wakeCreditCatchup()
 	}
 	a.activity(r.Context(), "import", fmt.Sprintf("Imported %d local watchers; %d exact-ID duplicates skipped; biography enrichment queued", added, skipped), "ok")
 	respond(w, 200, map[string]any{"added": added, "skipped": skipped, "queued": added, "warning": "MDBList /people provides biographies, not filmographies. Only actual cast/person links produce release matches. Remote favorites are unchanged."})
@@ -865,8 +919,12 @@ func (a *App) syncOnceResult(ctx context.Context) (result syncCompletion, runErr
 				return result, err
 			}
 			after = p.ID
-			if strings.HasPrefix(p.MetadataStatus, "pending") || time.Since(p.UpdatedAt) > 7*24*time.Hour || (s.TMDB.Enabled && s.TMDB.APIKey != "" && !strings.HasPrefix(p.MetadataStatus, "unavailable: identity mismatch") && (strings.TrimSpace(p.Profile) == "" || strings.TrimSpace(p.Biography) == "" || strings.TrimSpace(p.Birthday) == "" || strings.TrimSpace(p.PlaceOfBirth) == "")) {
-				p = a.enrichPerson(ctx, s, p)
+			var didAttempt bool
+			p, didAttempt, e = a.refreshPersonBiography(ctx, s, p)
+			if e != nil {
+				return result, e
+			}
+			if didAttempt {
 				if _, e = a.savePersonMetadata(ctx, p); e != nil {
 					return result, e
 				}
@@ -895,15 +953,21 @@ func (a *App) syncOnceResult(ctx context.Context) (result syncCompletion, runErr
 		// silently so permanently unavailable metadata cannot block the whole app.
 	}
 	a.stage(ctx, "Bounded TMDb actor-credit discovery (4 actors, 40 title resolutions maximum)")
-	pendingCredits, creditErr := a.syncTMDBCredits(ctx, s)
+	_, creditErr := a.syncTMDBCredits(ctx, s)
 	if creditErr != nil {
 		return result, creditErr
 	}
-	if pendingCredits > 0 {
-		if summary != "" {
-			summary += "; "
+	if s.TMDB.Enabled && s.TMDB.APIKey != "" {
+		progress, err := a.tmdbCreditProgress(ctx, time.Now().UTC())
+		if err != nil {
+			return result, err
 		}
-		summary += fmt.Sprintf("%d actors have pending TMDb credit discovery; durable continuation saved for next sync; no complete filmography claimed", pendingCredits)
+		if progress.PendingActors > 0 {
+			if summary != "" {
+				summary += "; "
+			}
+			summary += fmt.Sprintf("TMDb credit discovery: %d pending actors (%d ready, %d deferred); %d ready credits, %d deferred credits; %d unattempted actors, %d unattempted credits; %d provider-blocked actors, %d provider-blocked credits (overlap ready/deferred counts, not additional work); durable continuation saved for next sync; no complete filmography claimed", progress.PendingActors, progress.ReadyActors, progress.DeferredActors, progress.PendingCredits, progress.DeferredCredits, progress.UnattemptedActors, progress.UnattemptedCredits, progress.ProviderBlockedActors, progress.ProviderBlockedCredits)
+		}
 	}
 	a.stage(ctx, "Refreshing configured Sonarr/Radarr inventories (read-only)")
 	if err := a.syncArr(ctx); err != nil {

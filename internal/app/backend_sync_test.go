@@ -179,6 +179,10 @@ func TestPostgresAutomationFailedAcquisitionRetriesButNotificationIsUncertain(t 
 	if e != nil {
 		t.Fatal(e)
 	}
+	// This retry test deliberately exercises a released title via explicit manual opt-in.
+	if _, e = a.db.Exec(ctx, `UPDATE releases SET monitored=true,monitoring_override=true WHERE id=$1`, r.ID); e != nil {
+		t.Fatal(e)
+	}
 	s := defaultSettings()
 	s.Automation.Enabled = true
 	s.Radarr.Enabled = true

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -56,10 +57,43 @@ func (a *App) saveSiloPresence(ctx context.Context, r Release, p integrations.Lo
 		// Keep the last completed catalog status, URL and checked_at on failures.
 		// A first failure has status=error; cached available/absent remains evidence
 		// with a separate failed-attempt diagnostic, never a false absence.
-		diagnostic, _ := json.Marshal(map[string]any{"error": providerError(checkErr), "last_check_status": "error", "last_attempt_at": time.Now().UTC()})
+		status := "error"
+		var gap *integrations.SiloCoverageError
+		if errors.As(checkErr, &gap) {
+			status = "warning"
+		}
+		diagnostic, _ := json.Marshal(map[string]any{"error": providerError(checkErr), "last_check_status": status, "last_attempt_at": time.Now().UTC()})
 		_, err = a.db.Exec(ctx, `UPDATE releases SET data=jsonb_set(data,'{local_availability}',CASE WHEN data->'local_availability'->>'status' IN ('available','absent') THEN (data->'local_availability')||$7::jsonb ELSE $2::jsonb END),updated_at=now() WHERE id=$1 AND media_type=$3 AND tmdb_id=$4 AND imdb_id=$5 AND COALESCE(data->>'tvdb_id','')=$6`, r.ID, raw, r.Type, r.TMDbID, r.IMDbID, r.TVDbID, diagnostic)
 	}
 	return err
+}
+
+// siloSyncWarning is a completed read-only reconciliation with per-title
+// coverage gaps, not a failed inventory read. Counts describe this attempt,
+// not cached evidence retained on the releases. It implements error solely for
+// compatibility with presence-sync callbacks; callers must classify it.
+type siloSyncWarning struct {
+	Available, Absent, Unknown           int
+	Unidentified, Ambiguous, Conflicting int
+}
+
+func (w *siloSyncWarning) Error() string {
+	return fmt.Sprintf("Silo presence sync completed with coverage warning: %d available, %d absent, %d unknown (%d unidentified, %d ambiguous, %d conflicting); prior verified presence retained", w.Available, w.Absent, w.Unknown, w.Unidentified, w.Ambiguous, w.Conflicting)
+}
+
+func presenceSyncOutcome(err error) (string, string) {
+	if err == nil {
+		return "ok", ""
+	}
+	// Only a standalone completed result is a warning. A join with a fatal
+	// transport, persistence or cancellation error must never be downgraded.
+	if warning, ok := err.(*siloSyncWarning); ok {
+		return "warning", warning.Error()
+	}
+	if warning, ok := err.(*arrSyncWarning); ok {
+		return "warning", warning.Error()
+	}
+	return "error", providerError(err)
 }
 
 // syncSilo updates only local JSON presence fields; the adapter performs GETs
@@ -82,7 +116,12 @@ func (a *App) syncSilo(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	inventoryErr := client.SiloInventory(ctx)
 	var failures []error
+	if inventoryErr != nil {
+		failures = append(failures, inventoryErr)
+	}
+	warning := &siloSyncWarning{}
 	for _, r := range releases {
 		if err = ctx.Err(); err != nil {
 			return err
@@ -90,15 +129,50 @@ func (a *App) syncSilo(ctx context.Context) error {
 		media, checkErr := presenceMedia(r)
 		p := integrations.LocalAvailability{Status: "error", CheckedAt: time.Now().UTC()}
 		if checkErr == nil {
-			p, checkErr = client.SiloAvailability(ctx, media)
+			if inventoryErr != nil {
+				checkErr = inventoryErr
+			} else {
+				p, checkErr = client.SiloAvailability(ctx, media)
+			}
+		}
+		var gap *integrations.SiloCoverageError
+		if errors.As(checkErr, &gap) {
+			p.Status = "unknown"
+			warning.Unknown++
+			switch gap.Reason {
+			case "unidentified":
+				warning.Unidentified++
+			case "ambiguous":
+				warning.Ambiguous++
+			case "conflicting":
+				warning.Conflicting++
+			}
+		} else if checkErr != nil {
+			failures = append(failures, checkErr)
+		} else {
+			switch p.Status {
+			case "available":
+				warning.Available++
+			case "absent":
+				warning.Absent++
+			case "unknown":
+				warning.Unknown++
+				warning.Unidentified++
+				checkErr = &integrations.SiloCoverageError{Reason: "unidentified"}
+			}
 		}
 		if checkErr != nil {
 			p.Error = providerError(checkErr)
-			failures = append(failures, checkErr)
 		}
 		if err = a.saveSiloPresence(ctx, r, p, checkErr); err != nil {
 			return err
 		}
 	}
-	return errors.Join(failures...)
+	if len(failures) > 0 {
+		return errors.Join(failures...)
+	}
+	if warning.Unknown > 0 {
+		return warning
+	}
+	return nil
 }

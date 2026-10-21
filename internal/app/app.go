@@ -39,6 +39,8 @@ type App struct {
 	providerClient *integrations.Client
 
 	manualSyncRunning bool // guarded by mu; held through syncOnce's deferred cleanup
+	started           bool
+	creditCatchupWake chan struct{}
 }
 type SyncState struct {
 	Running   bool       `json:"running"`
@@ -155,7 +157,16 @@ func New(ctx context.Context, cfg Config) (*App, error) {
 }
 func (a *App) Close() { a.mu.Lock(); a.cancel(); a.mu.Unlock(); a.wg.Wait(); a.db.Close() }
 func (a *App) Start() {
-	a.wg.Add(1)
+	a.mu.Lock()
+	if a.started || a.ctx.Err() != nil {
+		a.mu.Unlock()
+		return
+	}
+	a.started = true
+	a.creditCatchupWake = make(chan struct{}, 1)
+	a.wg.Add(2)
+	go func() { defer a.wg.Done(); a.creditCatchupLoop() }()
+	a.mu.Unlock()
 	go func() {
 		defer a.wg.Done()
 		a.runDueSchedules(a.ctx)

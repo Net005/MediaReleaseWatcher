@@ -29,7 +29,9 @@ const actorNotifyGate = `EXISTS(SELECT 1 FROM release_people rp JOIN actresses p
 const listAcquireGate = `EXISTS(SELECT 1 FROM release_lists rl JOIN mdblist_lists l ON l.id=rl.list_id WHERE rl.release_id=r.id AND l.enabled AND l.monitored AND l.auto_add)`
 const actorMonitorGate = `EXISTS(SELECT 1 FROM release_people rp JOIN actresses p ON p.id=rp.actress_id WHERE rp.release_id=r.id AND COALESCE((p.data->>'monitored')::boolean,false) AND (COALESCE((p.data->>'auto_add')::boolean,false) OR COALESCE((p.data->>'notify')::boolean,false)) AND COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%')`
 const listMonitorGate = `EXISTS(SELECT 1 FROM release_lists rl JOIN mdblist_lists l ON l.id=rl.list_id WHERE rl.release_id=r.id AND l.enabled AND l.monitored)`
-const recomputeMonitoring = `UPDATE releases r SET monitored=COALESCE(r.monitoring_override,` + listMonitorGate + ` OR ` + actorMonitorGate + `)`
+
+// Manual overrides remain authoritative; automatic policies only monitor upcoming titles.
+const recomputeMonitoring = `UPDATE releases r SET monitored=COALESCE(r.monitoring_override,(` + upcomingReleasePredicate + `) AND (` + listMonitorGate + ` OR ` + actorMonitorGate + `))`
 
 func syncListPolicies(ctx context.Context, tx pgx.Tx, s Settings) error {
 	if _, err := tx.Exec(ctx, `UPDATE mdblist_lists SET enabled=false,monitored=false,auto_add=false`); err != nil {

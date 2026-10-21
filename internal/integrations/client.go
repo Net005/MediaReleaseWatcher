@@ -121,6 +121,12 @@ func (c *Client) request(ctx context.Context, service, method, target, key, cont
 }
 
 func (c *Client) requestHeaders(ctx context.Context, service, method, target, key, contentType string, body []byte, headers http.Header) (json.RawMessage, error) {
+	return c.requestHeadersLimit(ctx, service, method, target, key, contentType, body, headers, maxResponseBytes)
+}
+
+// requestHeadersLimit retains the shared transport's security and cancellation
+// behavior with a per-request bound; it never changes client-wide state.
+func (c *Client) requestHeadersLimit(ctx context.Context, service, method, target, key, contentType string, body []byte, headers http.Header, responseLimit int) (json.RawMessage, error) {
 	if len(body) > maxRequestBytes {
 		return nil, errors.New("integration request exceeds size limit")
 	}
@@ -165,11 +171,11 @@ func (c *Client) requestHeaders(ctx context.Context, service, method, target, ke
 		}
 		return nil, e
 	}
-	raw, err := io.ReadAll(io.LimitReader(res.Body, maxResponseBytes+1))
+	raw, err := io.ReadAll(io.LimitReader(res.Body, int64(responseLimit)+1))
 	if err != nil {
 		return nil, fmt.Errorf("%s response read failed", service)
 	}
-	if len(raw) > maxResponseBytes {
+	if len(raw) > responseLimit {
 		return nil, fmt.Errorf("%s response exceeds size limit", service)
 	}
 	if !json.Valid(raw) {

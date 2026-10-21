@@ -2,11 +2,14 @@ package integrations
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,6 +19,76 @@ import (
 // and Silo-Server/silo-server/contracts/api/v2/openapi.json.
 const siloCacheTTL = 5 * time.Minute
 const siloMaxPages = 1000
+
+// Clients of the same normalized endpoint share a no-burst 10 GETs/second
+// budget and Retry-After cooldown, independent of credentials or profile.
+// Registry keys are digests, never endpoint strings or credentials.
+type siloReadGate struct {
+	token chan struct{}
+	next  time.Time
+	users int
+}
+
+var siloReadGates = struct {
+	sync.Mutex
+	entries map[[32]byte]*siloReadGate
+}{entries: make(map[[32]byte]*siloReadGate)}
+
+// Retain idle gates only while their pacing/cooldown still applies. References
+// include token waiters, so cleanup cannot split an endpoint's active budget.
+func acquireSiloReadGate(base string) (*siloReadGate, func()) {
+	u, _ := url.Parse(base) // endpoint validation has already succeeded.
+	u.Scheme = strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Hostname())
+	port := u.Port()
+	if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if port != "" {
+		u.Host = net.JoinHostPort(host, port)
+	} else if strings.Contains(host, ":") {
+		u.Host = "[" + host + "]"
+	} else {
+		u.Host = host
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	key := sha256.Sum256([]byte(u.String()))
+	siloReadGates.Lock()
+	for k, gate := range siloReadGates.entries {
+		if gate.users == 0 && !time.Now().Before(gate.next) {
+			delete(siloReadGates.entries, k)
+		}
+	}
+	gate := siloReadGates.entries[key]
+	if gate == nil {
+		gate = &siloReadGate{token: make(chan struct{}, 1)}
+		siloReadGates.entries[key] = gate
+	}
+	gate.users++
+	siloReadGates.Unlock()
+	return gate, func() {
+		siloReadGates.Lock()
+		gate.users--
+		siloReadGates.Unlock()
+	}
+}
+
+// SiloCoverageError describes a per-title identity gap in a completely read
+// inventory. It never represents HTTP, pagination or inventory validation errors.
+type SiloCoverageError struct {
+	Reason string
+}
+
+func (e *SiloCoverageError) Error() string {
+	switch e.Reason {
+	case "conflicting":
+		return "silo match has conflicting provider identities"
+	case "ambiguous":
+		return "silo match is ambiguous"
+	default:
+		return "silo item has no provider identity; availability is unknown"
+	}
+}
 
 type LocalAvailability struct {
 	Status    string    `json:"status"`
@@ -59,11 +132,48 @@ func (c *Client) siloGet(ctx context.Context, path string, q url.Values, profile
 	if profile != "" {
 		headers.Set("X-Profile-Id", profile)
 	}
-	raw, err := c.requestHeaders(ctx, "silo", http.MethodGet, target, "", "", nil, headers)
-	if err != nil {
-		return err
+	// Retry only this read-only adapter, never the shared transport's writes.
+	// Bound total time as well as attempts, even without a caller deadline.
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	gate, release := acquireSiloReadGate(c.cfg.SiloURL)
+	defer release()
+	select {
+	case gate.token <- struct{}{}:
+	case <-ctx.Done():
+		return errors.New("silo request canceled or timed out")
 	}
-	return decode(raw, out, "silo")
+	defer func() { <-gate.token }()
+	for attempt := 0; attempt < 3; attempt++ {
+		if delay := time.Until(gate.next); delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return errors.New("silo request canceled or timed out")
+			case <-timer.C:
+			}
+		}
+		if ctx.Err() != nil {
+			return errors.New("silo request canceled or timed out")
+		}
+		gate.next = time.Now().Add(100 * time.Millisecond)
+		raw, err := c.requestHeaders(ctx, "silo", http.MethodGet, target, "", "", nil, headers)
+		if err == nil {
+			return decode(raw, out, "silo")
+		}
+		var limited *HTTPError
+		if !errors.As(err, &limited) || limited.StatusCode != http.StatusTooManyRequests {
+			return err
+		}
+		if until := time.Now().Add(limited.RetryAfter); until.After(gate.next) {
+			gate.next = until
+		}
+		if attempt == 2 {
+			return err
+		}
+	}
+	return errors.New("silo retry limit exceeded")
 }
 func (c *Client) siloProfile(ctx context.Context) (string, error) {
 	var result struct {
@@ -215,6 +325,16 @@ func positiveLiteralID(id string) bool {
 // SiloAvailability reports exact, type-consistent catalog presence only, not
 // disk readability or playability. Absence requires a complete catalog scan.
 // Cached snapshots are per-client, credential-scoped, and published atomically.
+// SiloInventory verifies a complete catalogue read before reconciliation, including
+// runs whose local titles have no usable provider identities. Subsequent lookups
+// reuse the same validated snapshot.
+func (c *Client) SiloInventory(ctx context.Context) error {
+	c.siloMu.Lock()
+	defer c.siloMu.Unlock()
+	_, err := c.siloInventory(ctx)
+	return err
+}
+
 func (c *Client) SiloAvailability(ctx context.Context, m Media) (out LocalAvailability, err error) {
 	out = LocalAvailability{Status: "unknown", CheckedAt: time.Now().UTC()}
 	defer func() {
@@ -252,17 +372,17 @@ func (c *Client) SiloAvailability(ctx context.Context, m Media) (out LocalAvaila
 			continue
 		}
 		if (m.TMDbID > 0 && item.TMDbID != "" && item.TMDbID != strconv.Itoa(m.TMDbID)) || (m.IMDbID != "" && item.IMDbID != "" && item.IMDbID != m.IMDbID) || (m.TVDbID > 0 && item.TVDbID != "" && item.TVDbID != strconv.Itoa(m.TVDbID)) {
-			return out, errors.New("silo match has conflicting provider identities")
+			return out, &SiloCoverageError{Reason: "conflicting"}
 		}
 		if match != nil {
-			return out, errors.New("silo match is ambiguous")
+			return out, &SiloCoverageError{Reason: "ambiguous"}
 		}
 		copy := item
 		match = &copy
 	}
 	if match == nil {
 		if snapshot.unidentified[kind] {
-			return out, errors.New("silo item has no provider identity; availability is unknown")
+			return out, &SiloCoverageError{Reason: "unidentified"}
 		}
 		out.Status = "absent"
 		return out, nil

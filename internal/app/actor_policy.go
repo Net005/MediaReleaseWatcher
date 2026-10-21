@@ -16,7 +16,7 @@ func baselineActorActivation(ctx context.Context, tx pgx.Tx, before, after Actre
 		if old || !on {
 			continue
 		}
-		_, err := tx.Exec(ctx, `INSERT INTO actions(release_id,kind,status,event_key) SELECT rp.release_id,$2,'baseline',CASE WHEN nullif(r.data->>'release_date','')::date>(now() AT TIME ZONE 'UTC')::date THEN 'upcoming' WHEN nullif(r.data->>'release_date','') IS NOT NULL THEN 'released' ELSE 'discovered' END FROM release_people rp JOIN releases r ON r.id=rp.release_id WHERE rp.actress_id=$1 ON CONFLICT DO NOTHING`, after.ID, kind)
+		_, err := tx.Exec(ctx, `INSERT INTO actions(release_id,kind,status,event_key) SELECT rp.release_id,$2,'baseline',CASE WHEN `+upcomingReleasePredicate+` THEN 'upcoming' WHEN nullif(r.data->>'release_date','') IS NOT NULL THEN 'released' ELSE 'discovered' END FROM release_people rp JOIN releases r ON r.id=rp.release_id WHERE rp.actress_id=$1 ON CONFLICT DO NOTHING`, after.ID, kind)
 		if err != nil {
 			return err
 		}

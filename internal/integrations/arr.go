@@ -33,6 +33,12 @@ func (c *Client) arr(kind string) (arrService, error) {
 	}
 	return s, nil
 }
+
+// Full manager catalogues can exceed 8 MiB (observed Radarr: 41 MiB).
+// Keep this allowance local to unfiltered inventory GETs, never mutations,
+// lookups, item readbacks or other providers.
+const maxArrInventoryBytes = 64 << 20
+
 func (c *Client) arrRequest(ctx context.Context, s arrService, method, path string, q url.Values, body any, out any) error {
 	target, err := endpoint(s.base, "/api/v3/"+path, q)
 	if err != nil {
@@ -45,7 +51,11 @@ func (c *Client) arrRequest(ctx context.Context, s arrService, method, path stri
 			return fmt.Errorf("%s request encoding failed", s.kind)
 		}
 	}
-	raw, err := c.request(ctx, s.kind, method, target, s.key, "application/json", payload)
+	limit := maxResponseBytes
+	if method == http.MethodGet && body == nil && len(q) == 0 && ((s.kind == "radarr" && path == "movie") || (s.kind == "sonarr" && path == "series")) {
+		limit = maxArrInventoryBytes
+	}
+	raw, err := c.requestHeadersLimit(ctx, s.kind, method, target, s.key, "application/json", payload, nil, limit)
 	if err != nil {
 		return err
 	}

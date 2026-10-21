@@ -6,9 +6,22 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// tmdbUnavailable carries only a safe retry time, never an upstream URL/body.
+type tmdbUnavailable struct{ RetryAt time.Time }
+
+func (e *tmdbUnavailable) Error() string { return "TMDb response unavailable" }
+func tmdbRetryAt(err error, fallback time.Time) time.Time {
+	var unavailable *tmdbUnavailable
+	if errors.As(err, &unavailable) && unavailable.RetryAt.After(fallback) {
+		return unavailable.RetryAt
+	}
+	return fallback
+}
 
 // tmdbGet never returns upstream bodies, URLs or transport errors containing credentials.
 func (a *App) tmdbGet(ctx context.Context, s Settings, path string) (map[string]any, error) {
@@ -26,14 +39,47 @@ func (a *App) tmdbGet(ctx context.Context, s Settings, path string) (map[string]
 		return nil, errors.New("TMDb request invalid")
 	}
 	client := http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect blocked") }}
-	res, e := client.Do(req)
-	if e != nil {
-		return nil, errors.New("TMDb request failed")
+	var res *http.Response
+	for attempt := 0; attempt < 3; attempt++ {
+		res, e = client.Do(req.Clone(ctx))
+		if e != nil {
+			return nil, errors.New("TMDb request failed")
+		}
+		if res.StatusCode == http.StatusOK {
+			break
+		}
+		status, retryAfter := res.StatusCode, res.Header.Get("Retry-After")
+		res.Body.Close()
+		now := time.Now()
+		retryAt := now.Add(time.Duration(1<<attempt) * 250 * time.Millisecond)
+		if seconds, err := strconv.ParseInt(strings.TrimSpace(retryAfter), 10, 64); err == nil && seconds >= 0 {
+			// Bound invalid/hostile durations before converting to nanoseconds.
+			if seconds > int64((365*24*time.Hour)/time.Second) {
+				seconds = int64((365 * 24 * time.Hour) / time.Second)
+			}
+			provided := now.Add(time.Duration(seconds) * time.Second)
+			if provided.After(retryAt) {
+				retryAt = provided
+			}
+		} else if provided, err := http.ParseTime(retryAfter); err == nil && provided.After(retryAt) {
+			retryAt = provided
+		}
+		unavailable := &tmdbUnavailable{RetryAt: retryAt}
+		if attempt == 2 || (status != 429 && status != 502 && status != 503 && status != 504) {
+			return nil, unavailable
+		}
+		if deadline, ok := ctx.Deadline(); ok && !retryAt.Before(deadline) {
+			return nil, unavailable
+		}
+		timer := time.NewTimer(time.Until(retryAt))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, unavailable
+		case <-timer.C:
+		}
 	}
 	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return nil, errors.New("TMDb response unavailable")
-	}
 	b, e := io.ReadAll(io.LimitReader(res.Body, (8<<20)+1))
 	if e != nil || len(b) > 8<<20 {
 		return nil, errors.New("TMDb response invalid")
@@ -109,9 +155,13 @@ func (a *App) tmdbPerson(ctx context.Context, s Settings, p Actress) (Actress, e
 }
 
 type tmdbCredit struct {
-	ID       string `json:"id"`
-	Kind     string `json:"kind"`
-	Resolved bool   `json:"resolved"`
+	ID        string    `json:"id"`
+	Kind      string    `json:"kind"`
+	Resolved  bool      `json:"resolved"`
+	Attempts  int       `json:"attempts,omitempty"`
+	Attempted time.Time `json:"attempted,omitempty"`
+	NextRetry time.Time `json:"next_retry,omitempty"`
+	Error     string    `json:"error,omitempty"`
 }
 
 func (a *App) tmdbPersonCredits(ctx context.Context, s Settings, id string) ([]tmdbCredit, error) {

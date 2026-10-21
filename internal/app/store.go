@@ -45,6 +45,11 @@ func (a *App) saveActress(ctx context.Context, p Actress) (Actress, error) {
 	if _, e = tx.Exec(ctx, recomputeMonitoring); e != nil {
 		return p, e
 	}
+	if lookup == pgx.ErrNoRows {
+		if _, e = tx.Exec(ctx, `INSERT INTO app_state(key,value) VALUES('credit_catchup:'||$1::bigint::text,'{}') ON CONFLICT DO NOTHING`, p.ID); e != nil {
+			return p, e
+		}
+	}
 	return p, tx.Commit(ctx)
 }
 
@@ -109,7 +114,9 @@ func (a *App) getActress(ctx context.Context, id int64) (Actress, error) {
 	return p, e
 }
 
-const upcomingReleasePredicate = `nullif(r.data->>'release_date','')::date > (now() AT TIME ZONE 'UTC')::date`
+// CASE keeps malformed or non-canonical provider dates away from the date cast.
+// UTC calendar days are intentional: a release dated today is no longer upcoming.
+const upcomingReleasePredicate = `CASE WHEN r.data->>'release_date' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' AND pg_input_is_valid(r.data->>'release_date','date') THEN (r.data->>'release_date')::date > (now() AT TIME ZONE 'UTC')::date ELSE false END`
 
 func (a *App) actresses(ctx context.Context, q, group string, upcomingOnly ...bool) ([]Actress, error) {
 	upcoming := len(upcomingOnly) > 0 && upcomingOnly[0]

@@ -59,6 +59,22 @@ async function app({authenticated=true,needsSetup=false,withRelease=false,config
   return {page,requests,errors};
 }
 
+test('sync chip distinguishes partial coverage from a failed run without hiding diagnostics',async()=>{
+  for(const state of [
+    {stage:'partial',label:'Synced with gaps',className:'warning'},
+    {stage:'failed',label:'Sync issue',className:'error'}
+  ]) {
+    const message='Provider metadata missing; retry pending';
+    const {page,errors}=await app({handle:({path})=>path==='/api/dashboard'?{data:{stats:{},featured:[],upcoming:[],recent:[],activity:[],sync:{running:false,stage:state.stage,last_run:'2026-10-20T12:00:00Z',last_error:message}}}:undefined});
+    try {
+      await page.locator('#sync-status').getByText(state.label,{exact:true}).waitFor();
+      assert.equal(await page.locator('#sync-status').getAttribute('class'),'sync-chip '+state.className);
+      assert.equal(await page.locator('#sync-status').getAttribute('title'),message);
+      assert.deepEqual(errors,[]);
+    } finally { await page.close(); }
+  }
+});
+
 for (const kind of ['actress','person']) test(`${kind} details sort the complete known releases newest first with unknown dates last and deterministic ties`,async()=>{
   const entries=[
     {id:9,title:'Unknown',release_date:''},

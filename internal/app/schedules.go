@@ -621,8 +621,7 @@ func (a *App) executeScheduleWithSync(parent context.Context, claim *scheduleCla
 		status, message = completion.Status, completion.Message
 	}
 	if runErr != nil {
-		status = "error"
-		message = providerError(runErr)
+		status, message = presenceSyncOutcome(runErr)
 	}
 	// Compute from completion, not the old due time: slow jobs and downtime cannot
 	// trigger a burst of catch-up runs. Once is consumed before any side effect.

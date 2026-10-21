@@ -12,7 +12,7 @@ func TestPostgresActorOptinMonitoringAndActivationBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := policyRelease(t, a, "42")
+	r := upcomingPolicyRelease(t, a, "42")
 	r, err = a.saveRelease(ctx, r, []string{"123"})
 	if err != nil || r.Monitored {
 		t.Fatal("monitor-only actor opted in", r, err)
@@ -30,7 +30,7 @@ func TestPostgresActorOptinMonitoringAndActivationBaseline(t *testing.T) {
 	if err = a.db.QueryRow(ctx, `SELECT count(*) FROM actions WHERE release_id=$1 AND status='baseline'`, r.ID).Scan(&count); err != nil || count != 2 {
 		t.Fatal(count, err)
 	}
-	n := policyRelease(t, a, "43")
+	n := upcomingPolicyRelease(t, a, "43")
 	n, err = a.saveRelease(ctx, n, []string{"123"})
 	if err != nil || !n.Monitored {
 		t.Fatal(n, err)
@@ -53,8 +53,8 @@ func TestPostgresListPolicyMembershipAndManualOverrides(t *testing.T) {
 	if err := a.saveSettings(ctx, s); err != nil {
 		t.Fatal(err)
 	}
-	r := policyRelease(t, a, "42")
-	other := policyRelease(t, a, "43")
+	r := upcomingPolicyRelease(t, a, "42")
+	other := upcomingPolicyRelease(t, a, "43")
 	if r.Monitored {
 		t.Fatal("discovery automatically monitored")
 	}

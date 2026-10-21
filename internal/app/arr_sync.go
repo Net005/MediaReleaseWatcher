@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
@@ -160,12 +161,29 @@ func presenceMedia(r Release) (integrations.Media, error) {
 	}
 	return m, nil
 }
+
+type arrCoverageGap struct{ reason string }
+
+func (e *arrCoverageGap) Error() string { return "manager presence identity coverage: " + e.reason }
+
+type arrCoverageCounts struct{ Present, Absent, Unknown int }
+type arrSyncWarning struct{ Sonarr, Radarr arrCoverageCounts }
+
+func (w *arrSyncWarning) Error() string {
+	return fmt.Sprintf("Arr read-only presence sync completed with coverage warning: Sonarr %d present, %d absent, %d unknown; Radarr %d present, %d absent, %d unknown; prior verified presence retained", w.Sonarr.Present, w.Sonarr.Absent, w.Sonarr.Unknown, w.Radarr.Present, w.Radarr.Absent, w.Radarr.Unknown)
+}
 func (a *App) saveArrPresence(ctx context.Context, r Release, kind string, p integrations.ArrPresence, checkErr error) error {
 	at := time.Now().UTC().Format(time.RFC3339Nano)
-	patch := map[string]string{kind + "_error": "", kind + "_last_attempt_at": at, kind + "_last_check_status": "ok"}
+	patch := map[string]string{kind + "_warning": "", kind + "_error": "", kind + "_last_attempt_at": at, kind + "_last_check_status": "ok"}
 	if checkErr != nil {
 		patch[kind+"_error"] = providerError(checkErr)
 		patch[kind+"_last_check_status"] = "error"
+		var gap *arrCoverageGap
+		if errors.As(checkErr, &gap) {
+			patch[kind+"_error"] = ""
+			patch[kind+"_warning"] = gap.Error()
+			patch[kind+"_last_check_status"] = "warning"
+		}
 	} else {
 		patch[kind+"_checked_at"] = at
 		patch[kind] = ""
@@ -190,7 +208,7 @@ func (a *App) saveArrPresence(ctx context.Context, r Release, kind string, p int
 	if checkErr != nil {
 		// A failed attempt never changes the timestamp or status of verified
 		// evidence. First failures are explicit errors rather than false absence.
-		_, err = a.db.Exec(ctx, `UPDATE releases SET acquisition=(CASE WHEN acquisition->>($7::text||'_status') IN ('present','absent') THEN acquisition ELSE acquisition||jsonb_build_object($7::text||'_status','error') END)||$2::jsonb,updated_at=now() WHERE id=$1 AND media_type=$3 AND tmdb_id=$4 AND imdb_id=$5 AND COALESCE(data->>'tvdb_id','')=$6`, r.ID, raw, r.Type, r.TMDbID, r.IMDbID, r.TVDbID, kind)
+		_, err = a.db.Exec(ctx, `UPDATE releases SET acquisition=(CASE WHEN acquisition->>($7::text||'_status') IN ('present','absent') THEN acquisition ELSE acquisition||jsonb_build_object($7::text||'_status',$8::text) END)||$2::jsonb,updated_at=now() WHERE id=$1 AND media_type=$3 AND tmdb_id=$4 AND imdb_id=$5 AND COALESCE(data->>'tvdb_id','')=$6`, r.ID, raw, r.Type, r.TMDbID, r.IMDbID, r.TVDbID, kind, map[bool]string{true: "unknown", false: "error"}[patch[kind+"_last_check_status"] == "warning"])
 	} else {
 		_, err = a.db.Exec(ctx, `UPDATE releases SET acquisition=acquisition||$2::jsonb,updated_at=now() WHERE id=$1 AND media_type=$3 AND tmdb_id=$4 AND imdb_id=$5 AND COALESCE(data->>'tvdb_id','')=$6`, r.ID, raw, r.Type, r.TMDbID, r.IMDbID, r.TVDbID)
 	}
@@ -215,12 +233,17 @@ func (a *App) syncArr(ctx context.Context) error {
 	}
 	client := a.client(s)
 	var failures []error
+	warning := &arrSyncWarning{}
 	for _, manager := range []struct {
 		kind, mediaType string
 		cfg             ArrSettings
 	}{{"radarr", "movie", s.Radarr}, {"sonarr", "show", s.Sonarr}} {
 		if manager.cfg.URL == "" || manager.cfg.APIKey == "" {
 			continue
+		}
+		counts := &warning.Radarr
+		if manager.kind == "sonarr" {
+			counts = &warning.Sonarr
 		}
 		inventory, inventoryErr := client.ArrInventory(ctx, manager.kind)
 		if inventoryErr != nil {
@@ -236,13 +259,50 @@ func (a *App) syncArr(ctx context.Context) error {
 			var presence integrations.ArrPresence
 			checkErr := inventoryErr
 			if checkErr == nil {
-				media, e := presenceMedia(r)
-				checkErr = e
-				if checkErr == nil {
-					presence, checkErr = inventory.Match(media)
+				// Resolve only missing show identities after a complete Sonarr read.
+				// Unavailable enrichment remains a coverage gap, never absence.
+				if manager.kind == "sonarr" && r.Type == "show" && r.TVDbID == "" && r.IMDbID == "" && numericID.MatchString(r.TMDbID) && s.TMDB.Enabled && s.TMDB.APIKey != "" {
+					resolved, resolveErr := a.resolveShowExternalIDs(ctx, s, r)
+					r = resolved
+					var externalErr *showExternalIDsError
+					if errors.As(resolveErr, &externalErr) {
+						switch externalErr.Code {
+						case "cache_unavailable", "persistence_failed", "readback_failed":
+							checkErr = resolveErr
+						}
+					}
+					if err = ctx.Err(); err != nil {
+						return err
+					}
 				}
-				if checkErr != nil {
+				media, e := presenceMedia(r)
+				if checkErr == nil {
+					checkErr = e
+				}
+				if checkErr == nil {
+					if media.IMDbID == "" && ((manager.kind == "sonarr" && media.TVDbID == 0) || (manager.kind == "radarr" && media.TMDbID == 0)) {
+						checkErr = &arrCoverageGap{reason: "missing native provider ID and IMDb ID"}
+					} else {
+						presence, checkErr = inventory.Match(media)
+						// Match is local to the completed snapshot. Whitelist only its
+						// fixed identity diagnostics; all other errors stay fatal.
+						if checkErr != nil {
+							switch checkErr.Error() {
+							case "manager match is ambiguous", "manager match has conflicting provider identities":
+								checkErr = &arrCoverageGap{reason: checkErr.Error()}
+							}
+						}
+					}
+				}
+				var gap *arrCoverageGap
+				if errors.As(checkErr, &gap) {
+					counts.Unknown++
+				} else if checkErr != nil {
 					failures = append(failures, checkErr)
+				} else if presence.ID > 0 {
+					counts.Present++
+				} else {
+					counts.Absent++
 				}
 			}
 			if err = a.saveArrPresence(ctx, r, manager.kind, presence, checkErr); err != nil {
@@ -250,7 +310,13 @@ func (a *App) syncArr(ctx context.Context) error {
 			}
 		}
 	}
-	return errors.Join(failures...)
+	if len(failures) > 0 {
+		return errors.Join(failures...)
+	}
+	if warning.Sonarr.Unknown+warning.Radarr.Unknown > 0 {
+		return warning
+	}
+	return nil
 }
 func (a *App) startPresenceSync(kind string, run func(context.Context) error) bool {
 	a.mu.Lock()
@@ -263,11 +329,13 @@ func (a *App) startPresenceSync(kind string, run func(context.Context) error) bo
 		defer a.wg.Done()
 		ctx, cancel := context.WithTimeout(a.ctx, 15*time.Minute)
 		defer cancel()
-		if err := run(ctx); err != nil {
-			a.activity(ctx, kind, kind+" sync failed: "+providerError(err), "error")
-		} else {
-			a.activity(ctx, kind, kind+" read-only presence sync completed", "ok")
+		status, message := presenceSyncOutcome(run(ctx))
+		if status == "ok" {
+			message = kind + " read-only presence sync completed"
+		} else if status == "error" {
+			message = kind + " sync failed: " + message
 		}
+		a.activity(ctx, kind, message, status)
 	}()
 	return true
 }

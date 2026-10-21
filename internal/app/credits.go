@@ -11,22 +11,161 @@ import (
 	"time"
 )
 
+type tmdbCreditProgress struct {
+	PendingActors          int
+	ReadyActors            int
+	DeferredActors         int
+	UnattemptedActors      int
+	UnattemptedCredits     int
+	PendingCredits         int
+	DeferredCredits        int
+	ProviderBlockedCredits int
+	ProviderBlockedActors  int
+	ErrorActors            int
+}
+
+// Cached-only coverage: pending actors includes deferred actors; pending credits
+// are immediately eligible, not proof that all pending actors have failed.
+func (a *App) tmdbCreditProgress(ctx context.Context, now time.Time) (tmdbCreditProgress, error) {
+	var progress tmdbCreditProgress
+	rows, err := a.db.Query(ctx, `SELECT COALESCE(c.value,'{}'::jsonb), ARRAY(SELECT r.media_type||':'||r.tmdb_id FROM releases r JOIN jsonb_array_elements(COALESCE(NULLIF(c.value->'credits','null'::jsonb),'[]'::jsonb)) credit ON r.tmdb_id=credit->>'id' AND r.media_type=credit->>'kind' WHERE COALESCE(credit->>'resolved','false')<>'true') FROM actresses p LEFT JOIN app_state c ON c.key='tmdb:actor:'||p.tmdb_id WHERE COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%'`)
+	if err != nil {
+		return progress, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw []byte
+		var primaryIDs []string
+		if err := rows.Scan(&raw, &primaryIDs); err != nil {
+			return progress, err
+		}
+		var cache tmdbCreditCache
+		if err := json.Unmarshal(raw, &cache); err != nil {
+			return progress, err
+		}
+		if !cache.Complete {
+			progress.PendingActors++
+		}
+		if cache.Fetched.IsZero() && cache.Attempted.IsZero() && cache.Error == "" {
+			progress.UnattemptedActors++
+		}
+		ready := !cache.NextRetry.After(now) && (cache.Fetched.IsZero() || now.Sub(cache.Fetched) > 30*24*time.Hour || len(cache.Credits) == 0)
+		primary := map[string]bool{}
+		for _, id := range primaryIDs {
+			primary[id] = true
+		}
+		blocked := !cache.Complete && cache.Error != ""
+		for _, credit := range cache.Credits {
+			if credit.Resolved {
+				continue
+			}
+			if credit.Attempts == 0 {
+				progress.UnattemptedCredits++
+			}
+			if (credit.NextRetry.After(now) && !primary[credit.Kind+":"+credit.ID]) || cache.NextRetry.After(now) {
+				progress.DeferredCredits++
+			} else {
+				progress.PendingCredits++
+				ready = true
+			}
+			if credit.Error != "" {
+				progress.ProviderBlockedCredits++
+				blocked = true
+			}
+		}
+		if !cache.Complete {
+			if ready {
+				progress.ReadyActors++
+			} else {
+				progress.DeferredActors++
+			}
+		}
+		if blocked {
+			progress.ErrorActors++
+			progress.ProviderBlockedActors++
+		}
+	}
+	return progress, rows.Err()
+}
+
 type tmdbCreditCache struct {
-	Credits   []tmdbCredit `json:"credits"`
-	Fetched   time.Time    `json:"fetched"`
-	Attempted time.Time    `json:"attempted"`
-	Complete  bool         `json:"complete"`
-	Next      int          `json:"next"`
-	Error     string       `json:"error,omitempty"`
+	Credits       []tmdbCredit `json:"credits"`
+	Fetched       time.Time    `json:"fetched"`
+	Attempted     time.Time    `json:"attempted"`
+	Complete      bool         `json:"complete"`
+	Next          int          `json:"next"`
+	Error         string       `json:"error,omitempty"`
+	RetryAttempts int          `json:"retry_attempts,omitempty"`
+	NextRetry     time.Time    `json:"next_retry,omitempty"`
+}
+
+func (c *tmdbCredit) deferRetry(now time.Time) {
+	c.Attempts++
+	c.Attempted = now
+	c.NextRetry = now.Add(creditRetryDelay(c.Attempts))
+	c.Error = "MDBList title metadata unavailable"
+}
+
+func creditRetryDelay(attempts int) time.Duration {
+	d := time.Hour
+	for i := 1; i < attempts && d < 7*24*time.Hour; i++ {
+		d *= 2
+	}
+	if d > 7*24*time.Hour {
+		d = 7 * 24 * time.Hour
+	}
+	return d
+}
+
+// Unattempted work takes precedence; due retries retain circular fairness.
+func (c *tmdbCreditCache) selectCredits(now time.Time, budget int) map[string][]int {
+	selected := map[string][]int{}
+	n := len(c.Credits)
+	if n == 0 {
+		return selected
+	}
+	start := c.Next % n
+	if start < 0 {
+		start = 0
+	}
+	for pass := 0; pass < 2 && budget > 0; pass++ {
+		for examined := 0; examined < n && budget > 0; examined++ {
+			i := (start + examined) % n
+			credit := c.Credits[i]
+			if credit.Resolved || credit.NextRetry.After(now) || (pass == 0) != (credit.Attempts == 0) {
+				continue
+			}
+			selected[credit.Kind] = append(selected[credit.Kind], i)
+			c.Next = (i + 1) % n
+			budget--
+		}
+	}
+	return selected
 }
 
 // Four actors and ten title resolutions per actor per sync, independently resumable.
 // Full credit identities are saved before any title enrichment, never inferred from crew.
+const tmdbCreditActorSelection = `SELECT p.id,p.data,COALESCE(c.value,'{}'::jsonb) FROM actresses p LEFT JOIN app_state c ON c.key='tmdb:actor:'||p.tmdb_id
+ WHERE ($2::bigint[] IS NULL OR p.id=ANY($2::bigint[])) AND COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%'
+ AND COALESCE(NULLIF(c.value->>'next_retry','')::timestamptz,'-infinity'::timestamptz)<=now()
+ AND (COALESCE(NULLIF(c.value->>'fetched','')::timestamptz,'-infinity'::timestamptz)<$1::timestamptz
+ OR (COALESCE(c.value->>'complete','false')<>'true' AND (
+ jsonb_array_length(COALESCE(NULLIF(c.value->'credits','null'::jsonb),'[]'::jsonb))=0 OR EXISTS (
+ SELECT 1 FROM jsonb_array_elements(COALESCE(NULLIF(c.value->'credits','null'::jsonb),'[]'::jsonb)) credit
+ WHERE COALESCE(credit->>'resolved','false')<>'true'
+ AND (COALESCE(NULLIF(credit->>'next_retry','')::timestamptz,'-infinity'::timestamptz)<=now()
+ OR EXISTS (SELECT 1 FROM releases r WHERE r.media_type=credit->>'kind' AND r.tmdb_id=credit->>'id'))))))
+ ORDER BY COALESCE(NULLIF(c.value->>'attempted','')::timestamptz,'-infinity'::timestamptz),p.id LIMIT 4`
+
 func (a *App) syncTMDBCredits(ctx context.Context, s Settings) (int, error) {
+	return a.syncTMDBCreditsForWatches(ctx, s, nil)
+}
+
+func (a *App) syncTMDBCreditsForWatches(ctx context.Context, s Settings, watchIDs []int64) (int, error) {
 	if !s.TMDB.Enabled || s.TMDB.APIKey == "" {
 		return 0, nil
 	}
-	rows, e := a.db.Query(ctx, `SELECT p.id,p.data,COALESCE(c.value,'{}'::jsonb) FROM actresses p LEFT JOIN app_state c ON c.key='tmdb:actor:'||p.tmdb_id WHERE COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%' AND (COALESCE(c.value->>'complete','false')<>'true' OR COALESCE(c.value->>'fetched','')<$1) ORDER BY COALESCE(c.value->>'attempted',''),p.id LIMIT 4`, time.Now().UTC().Add(-30*24*time.Hour).Format(time.RFC3339Nano))
+	rows, e := a.db.Query(ctx, tmdbCreditActorSelection, time.Now().UTC().Add(-30*24*time.Hour).Format(time.RFC3339Nano), watchIDs)
 	if e != nil {
 		return 0, e
 	}
@@ -71,6 +210,8 @@ func (a *App) syncTMDBCredits(ctx context.Context, s Settings) (int, error) {
 		if _, err := a.tmdbPerson(ctx, s, j.p); err != nil {
 			j.c.Error = "TMDb person unavailable or identity mismatch; no credits attached"
 			j.c.Complete = false
+			j.c.RetryAttempts++
+			j.c.NextRetry = tmdbRetryAt(err, j.c.Attempted.Add(creditRetryDelay(j.c.RetryAttempts)))
 			if e = persist(); e != nil {
 				return 0, e
 			}
@@ -81,6 +222,8 @@ func (a *App) syncTMDBCredits(ctx context.Context, s Settings) (int, error) {
 			if err != nil {
 				j.c.Complete = false
 				j.c.Error = "TMDb combined cast credits unavailable; prior identities retained"
+				j.c.RetryAttempts++
+				j.c.NextRetry = tmdbRetryAt(err, j.c.Attempted.Add(creditRetryDelay(j.c.RetryAttempts)))
 				if e = persist(); e != nil {
 					return 0, e
 				}
@@ -101,16 +244,35 @@ func (a *App) syncTMDBCredits(ctx context.Context, s Settings) (int, error) {
 				return 0, e
 			}
 		}
-		selected := map[string][]int{}
-		budget := 10
-		for examined := 0; examined < len(j.c.Credits) && budget > 0; examined++ {
-			i := j.c.Next % len(j.c.Credits)
-			j.c.Next = (i + 1) % len(j.c.Credits)
-			if !j.c.Credits[i].Resolved {
-				selected[j.c.Credits[i].Kind] = append(selected[j.c.Credits[i].Kind], i)
-				budget--
+		j.c.RetryAttempts = 0
+		j.c.NextRetry = time.Time{}
+		// A title independently learned from the primary provider is usable now,
+		// even when its previous missing-metadata lookup is still deferred.
+		creditJSON, _ := json.Marshal(j.c.Credits)
+		localRows, err := a.db.Query(ctx, `SELECT r.tmdb_id,r.media_type FROM releases r JOIN jsonb_array_elements(COALESCE(NULLIF($1::jsonb,'null'::jsonb),'[]'::jsonb)) credit ON r.tmdb_id=credit->>'id' AND r.media_type=credit->>'kind' WHERE COALESCE(credit->>'resolved','false')<>'true'`, creditJSON)
+		if err != nil {
+			return 0, err
+		}
+		local := map[string]bool{}
+		for localRows.Next() {
+			var id, kind string
+			if err := localRows.Scan(&id, &kind); err != nil {
+				localRows.Close()
+				return 0, err
+			}
+			local[kind+":"+id] = true
+		}
+		err = localRows.Err()
+		localRows.Close()
+		if err != nil {
+			return 0, err
+		}
+		for i := range j.c.Credits {
+			if local[j.c.Credits[i].Kind+":"+j.c.Credits[i].ID] {
+				j.c.Credits[i].NextRetry = time.Time{}
 			}
 		}
+		selected := j.c.selectCredits(time.Now().UTC(), 10)
 		for _, kind := range []string{"movie", "show"} {
 			missing := []string{}
 			resolved := map[string]Release{}
@@ -148,6 +310,7 @@ func (a *App) syncTMDBCredits(ctx context.Context, s Settings) (int, error) {
 				c := j.c.Credits[i]
 				r, ok := resolved[c.ID]
 				if !ok {
+					j.c.Credits[i].deferRetry(time.Now().UTC())
 					j.c.Error = "MDBList title metadata unavailable for some verified TMDb cast identities; retry continuation retained"
 					continue
 				}
@@ -157,6 +320,10 @@ func (a *App) syncTMDBCredits(ctx context.Context, s Settings) (int, error) {
 					return 0, e
 				}
 				j.c.Credits[i].Resolved = true
+				j.c.Credits[i].Attempts++
+				j.c.Credits[i].Attempted = time.Now().UTC()
+				j.c.Credits[i].NextRetry = time.Time{}
+				j.c.Credits[i].Error = ""
 			}
 		}
 		j.c.Complete = true
@@ -170,7 +337,7 @@ func (a *App) syncTMDBCredits(ctx context.Context, s Settings) (int, error) {
 		}
 	}
 	var pending int
-	e = a.db.QueryRow(ctx, `SELECT count(*) FROM actresses p LEFT JOIN app_state c ON c.key='tmdb:actor:'||p.tmdb_id WHERE COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%' AND COALESCE(c.value->>'complete','false')<>'true'`).Scan(&pending)
+	e = a.db.QueryRow(ctx, `SELECT count(*) FROM actresses p LEFT JOIN app_state c ON c.key='tmdb:actor:'||p.tmdb_id WHERE ($1::bigint[] IS NULL OR p.id=ANY($1::bigint[])) AND COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%' AND COALESCE(c.value->>'complete','false')<>'true'`, watchIDs).Scan(&pending)
 	return pending, e
 }
 

@@ -110,7 +110,9 @@ func TestSiloSyncMissingAndMalformedIdentityNeverAbsent(t *testing.T) {
 	if e := a.syncSilo(ctx); e == nil {
 		t.Fatal("malformed identity not reported")
 	}
-	for _, tc := range []struct{ key, status string }{{"synthetic:missing", "unknown"}, {"synthetic:malformed", "error"}} {
+	// Even identity-less rows record a failed attempt when the required catalogue
+	// preflight cannot contact Silo; neither row can become verified absent.
+	for _, tc := range []struct{ key, status string }{{"synthetic:missing", "error"}, {"synthetic:malformed", "error"}} {
 		var got string
 		if e := a.db.QueryRow(ctx, `SELECT data->'local_availability'->>'status' FROM releases WHERE canonical_key=$1`, tc.key).Scan(&got); e != nil || got != tc.status {
 			t.Fatalf("%s=%s %v", tc.key, got, e)
