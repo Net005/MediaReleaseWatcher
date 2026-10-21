@@ -212,7 +212,7 @@ test('Arr inventory and readiness badges remain independent from Silo and failur
   const {page,errors}=await app({hash:'#/releases',handle:({path})=>path==='/api/releases'?{data:{items,total:4,page:1,limit:36}}:undefined});
   try {
     const cards=page.locator('.release-card');await cards.nth(3).waitFor();await cards.nth(0).getByText('Radarr inventory: present',{exact:true}).waitFor();await cards.nth(0).getByText('Radarr readiness: not ready',{exact:true}).waitFor();await cards.nth(1).getByText('Sonarr readiness: ready · 5 files',{exact:true}).waitFor();
-    await cards.nth(2).getByText('Radarr inventory: absent',{exact:true}).waitFor();await cards.nth(3).getByText('Radarr inventory: unknown',{exact:true}).waitFor();await cards.nth(3).getByText('Synthetic inventory check failed',{exact:true}).waitFor();
+    await cards.nth(2).getByText('Radarr inventory: absent',{exact:true}).waitFor();await cards.nth(3).getByText('Radarr inventory: unknown',{exact:true}).waitFor();await cards.nth(3).locator('details summary').click();await cards.nth(3).getByText('Synthetic inventory check failed',{exact:true}).waitFor();
     assert.equal(await page.getByText('Local file available',{exact:true}).count(),0);assert.equal(await page.getByRole('link',{name:'Open Radarr',exact:true}).getAttribute('href'),'https://arr.test/movie/1');assert.equal(await page.getByRole('link',{name:'Open Sonarr',exact:true}).count(),0);assert.deepEqual(errors,[]);
   }finally{await page.close();}
 });
@@ -653,6 +653,8 @@ test('watch and cast details separate MDBList biography from incomplete discover
     let dialog=page.getByRole('dialog',{name:'Actress watch',exact:true});
     await dialog.getByText('Factual MDBList biography.',{exact:true}).waitFor();
     for(const label of ['MDBList biography status','Discovery coverage'])assert.ok((await dialog.innerText()).toLowerCase().includes(label.toLowerCase()),await dialog.innerText());
+    assert.equal(await dialog.locator('.coverage-details').count(),1,'verbose coverage is collapsed');
+    await dialog.locator('.coverage-details summary').click();
     assert.match(await dialog.innerText(),/0 known matches does not mean no releases/i);
     assert.doesNotMatch(await dialog.innerText(),/tvmaze|historical outage|supplemental credits/i);
     assert.equal(await dialog.locator('a[href*="tvmaze"]').count(),0);
@@ -661,6 +663,7 @@ test('watch and cast details separate MDBList biography from incomplete discover
     dialog=page.getByRole('dialog',{name:'Person details',exact:true});
     await dialog.getByText('Factual MDBList biography.',{exact:true}).waitFor();
     assert.match(await dialog.innerText(),/Discovery coverage/);
+    await dialog.locator('.coverage-details summary').click();
     assert.match(await dialog.innerText(),/0 known matches does not mean no releases/i);
     assert.doesNotMatch(await dialog.innerText(),/tvmaze|historical outage/i);
     assert.equal(requests.some(r=>/credits|discovery/.test(r.path)||r.method!=='GET'),false);
@@ -714,6 +717,62 @@ test('TMDb connection tests only saved credentials and honestly reports rejected
     await card.locator('[name="tmdb.api_key"]').fill('unsaved-fixture');await card.getByRole('button',{name:'Test connection',exact:true}).click();assert.equal(requests.filter(r=>r.path==='/api/integrations/tmdb/test').length,2);
     assert.equal(requests.some(r=>JSON.stringify(r.query).includes('unsaved-fixture')),false);
     assert.doesNotMatch(await card.innerText(),/TVmaze/);
+  }finally{await page.close();}
+});
+
+test('provider logo links load locally and remain keyboard accessible in release and actress details',async()=>{
+  const row={...release(),acquisition:{radarr_status:'present',radarr_url:'https://arr.test/movie/1'},source_links:['https://www.themoviedb.org/movie/654321','https://mdblist.com/movie/tt7654321'],local_availability:{status:'error',error:'Synthetic Silo diagnostic retained',url:'https://silo.test/item/1'}};
+  const {page,requests}=await app({withRelease:true,hash:'#/release/1',handle:({path})=>path==='/api/releases/1'?{data:row}:path==='/api/releases/1/watchlist'?{data:{status:'absent',in_watchlist:false}}:undefined});
+  try {
+    const dialog=page.getByRole('dialog',{name:'Release details',exact:true});await dialog.getByRole('link',{name:'TMDb title',exact:true}).waitFor();
+    for(const name of ['Open Radarr','Open in Silo','Metadata: MDBList','IMDb title','TMDb title','MDBList title']) {
+      const link=dialog.getByRole('link',{name,exact:true});assert.equal(await link.count(),1);await link.focus();assert.equal(await link.evaluate(n=>n===document.activeElement),true);assert.match(await link.getAttribute('rel'),/noopener/);
+    }
+    await dialog.locator('.local-availability details summary').click();assert.match(await dialog.locator('.local-availability').innerText(),/Synthetic Silo diagnostic retained/);
+    for(const img of await dialog.locator('.provider-link img').all()) {await img.scrollIntoViewIfNeeded();await img.evaluate(n=>n.decode());assert.equal(await img.evaluate(n=>n.naturalWidth>0),true);assert.match(await img.getAttribute('src'),/^data:image\//);}
+    for(const width of [320,375,1440]) {await page.setViewportSize({width,height:1040});assert.equal(await dialog.evaluate(n=>n.scrollWidth<=n.clientWidth+1),true);await dialog.locator('.source-links').scrollIntoViewIfNeeded();await page.screenshot({path:`/home/hermes/.hermes/cache/scratch/mrw-detail-${width}.png`,fullPage:true});}
+    assert.equal(requests.some(r=>r.method!=='GET'),false);
+  }finally{await page.close();}
+});
+
+test('unknown Arr coverage keeps diagnostics expandable and identity-less Sonarr adds disabled',async()=>{
+  const item={...release(),type:'show',title:'Call Me Baby',tvdb_id:'',imdb_id:'',acquisition:{sonarr_status:'unknown',sonarr_error:'provider operation failed; check integration configuration or activity'}};
+  const {page}=await app({hash:'#/releases',handle:({path})=>path==='/api/releases'?{data:{items:[item],total:1,page:1,limit:36}}:undefined});
+  try {
+    const card=page.locator('.release-card');await card.waitFor();
+    assert.equal(await card.locator('[data-action="acquire"]').isDisabled(),true);
+    assert.match(await card.innerText(),/Needs TVDb or IMDb ID/);
+    const summary=card.locator('details.provider-diagnostic summary');await summary.waitFor();await summary.focus();await page.keyboard.press('Enter');
+    assert.match(await card.locator('details.provider-diagnostic').innerText(),/check integration configuration or activity/);
+    assert.equal(await card.locator('details.provider-diagnostic').getAttribute('open'),'');
+  }finally{await page.close();}
+});
+
+test('six-column and mobile release actions fit long labels and diagnostics',async()=>{
+  const titles=['Make Me Tingle','To My Beloved Thief','Call Me Baby','Good Partner','Whenever Possible','High Cookie'];
+  const rows=titles.map((title,i)=>({...release(),id:i+1,type:'show',title:i===5?title+' — '+ 'LongTitle'.repeat(15):title,source:'mdblist',monitoring_origin:'actress',genres:['Drama / '+ 'LongGenre'.repeat(10)],acquisition:{sonarr:'already_exists',sonarr_status:i===1?'present':'unknown',sonarr_error:i===2?'provider operation failed; '+ 'diagnostic'.repeat(50):'',sonarr_url:'https://sonarr.test/series/example'},local_availability:{status:'absent'}}));
+  const {page}=await app({hash:'#/releases',handle:({path})=>path==='/api/releases'?{data:{items:rows,total:6,page:1,limit:36}}:path==='/api/actresses/2'?{data:{actress:actress(),releases:rows,total:6}}:undefined});
+  try {
+    for(const width of [1440,375,320,2270]) {
+      await page.setViewportSize({width,height:1100});await page.locator('.release-card').first().waitFor();
+      const overflow=await page.locator('.release-card').evaluateAll(cards=>cards.flatMap(card=>Array.from(card.querySelectorAll('.card-actions button')).filter(b=>{const a=b.getBoundingClientRect(),c=card.getBoundingClientRect();return a.left<c.left-1||a.right>c.right+1||b.scrollWidth>b.clientWidth+1;}).map(b=>b.textContent)));
+      assert.deepEqual(overflow,[],'mutation controls must stay within each card');
+      const actions=await page.locator('.card-actions').evaluateAll(nodes=>nodes.map(n=>n.getBoundingClientRect().bottom));
+      if(width===1440){assert.ok(Math.max(...actions)-Math.min(...actions)<2,'desktop row actions align');assert.equal(await page.locator('.release-card').evaluateAll(cards=>new Set(cards.map(n=>Math.round(n.getBoundingClientRect().top))).size),1,'all six cards occupy one row');}
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+      for(const link of await page.locator('.release-card .provider-link').all()){await link.focus();assert.equal(await link.evaluate(n=>n===document.activeElement),true);}
+      for(const img of await page.locator('.provider-link img').all())await img.evaluate(n=>n.decode());
+      await page.screenshot({path:`/home/hermes/.hermes/cache/scratch/mrw-cards-${width}.png`,fullPage:true});
+      const diagnostic=page.locator('.provider-diagnostic').first();await diagnostic.locator('summary').focus();await page.keyboard.press('Enter');assert.match(await diagnostic.innerText(),/provider operation failed/);assert.equal(await diagnostic.evaluate(n=>n.scrollWidth<=n.clientWidth),true);await page.keyboard.press('Enter');
+    }
+    await page.goto(origin+'#/actresses');await page.locator('.actress-card [data-action=actress]').first().click();
+    const dialog=page.getByRole('dialog',{name:'Actress watch',exact:true});await dialog.locator('.release-card').nth(5).waitFor();
+    for(const width of [2270,375]) {
+      await page.setViewportSize({width,height:1624});
+      const bad=await dialog.locator('.release-card').evaluateAll(cards=>cards.some(card=>Array.from(card.querySelectorAll('button,a')).some(n=>{const a=n.getBoundingClientRect(),b=card.getBoundingClientRect();return a.right>b.right+1||a.left<b.left-1||n.scrollWidth>n.clientWidth+1;})));assert.equal(bad,false);
+      await dialog.locator('.section-heading').scrollIntoViewIfNeeded();
+      await page.screenshot({path:`/home/hermes/.hermes/cache/scratch/mrw-actress-${width}.png`,fullPage:true});
+    }
   }finally{await page.close();}
 });
 

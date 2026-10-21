@@ -11,6 +11,22 @@ test('current person metadata strips only retired credit diagnostics and preserv
   assert.equal(currentPersonMetadataStatus(undefined),'Unknown / not enriched');
 });
 
+test('provider button links use local official assets and reject unsafe or unsupported destinations', async()=>{
+  const {providerLink}=await import('../app.js');
+  assert.equal(typeof providerLink,'function');
+  for(const name of ['sonarr','radarr','mdblist','tmdb','imdb']) {
+    const html=providerLink(name,'https://example.test/title?a=1&b=2');
+    assert.match(html,/class="btn provider-link"/);assert.match(html,new RegExp('data-provider="'+name+'"'));assert.match(html,/src="data:image\/(png|svg\+xml);base64,/);assert.match(html,/alt=""/);assert.match(html,/noopener noreferrer/);assert.match(html,/&amp;b=2/);
+    const {readFile}=await import('node:fs/promises');
+    const bytes=await readFile(new URL('../providers/'+name+(name==='tmdb'?'.svg':'.png'),import.meta.url));
+    assert.equal(html.match(/;base64,([^"]+)/)[1],bytes.toString('base64'),'inline marks match the documented vendored bytes');
+  }
+  assert.match(providerLink('silo','https://silo.test/item'),/Open in Silo/);
+  assert.doesNotMatch(providerLink('silo','https://silo.test/item'),/providers\/silo/);
+  for(const name of ['unknown','constructor','__proto__'])assert.equal(providerLink(name,'https://example.test'),'');
+  for(const value of ['javascript:alert(1)','https://user:pass@example.test',''])assert.equal(providerLink('sonarr',value),'');
+});
+
 test('artwork is always sent through allowlisted HTTPS proxy', () => {
   assert.equal(artworkURL('https://image.tmdb.org/t/p/w500/a.jpg'), '/api/artwork?url=https%3A%2F%2Fimage.tmdb.org%2Ft%2Fp%2Fw500%2Fa.jpg');
   for (const unsafe of ['javascript:alert(1)', 'http://image.tmdb.org/a', 'https://image.tmdb.org.evil/a', 'https://127.0.0.1/a', 'https://a:b@image.tmdb.org/a', 'https://image.tmdb.org:444/a', '', '/private']) assert.equal(artworkURL(unsafe), '');

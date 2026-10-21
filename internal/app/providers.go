@@ -974,7 +974,11 @@ func (a *App) syncOnceResult(ctx context.Context) (result syncCompletion, runErr
 		if ctx.Err() != nil {
 			return result, ctx.Err()
 		}
-		a.activity(ctx, "arr", "Read-only inventory sync incomplete; prior availability retained: "+providerError(err), "warning")
+		status, message := presenceSyncOutcome(err)
+		if status == "error" {
+			message = "Read-only inventory sync incomplete; prior availability retained: " + message
+		}
+		a.activity(ctx, "arr", message, status)
 	}
 	a.stage(ctx, "Evaluating explicitly opted-in automation (initial baseline always silent)")
 	// Discovery may take hours. Re-read global consent/config after network work.
