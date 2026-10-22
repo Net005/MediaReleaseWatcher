@@ -11,6 +11,9 @@ import (
 	"time"
 )
 
+// Credit identities refresh daily, independently of person biography caching.
+const tmdbCreditRefreshInterval = 24 * time.Hour
+
 type tmdbCreditProgress struct {
 	PendingActors          int
 	ReadyActors            int
@@ -43,13 +46,14 @@ func (a *App) tmdbCreditProgress(ctx context.Context, now time.Time) (tmdbCredit
 		if err := json.Unmarshal(raw, &cache); err != nil {
 			return progress, err
 		}
-		if !cache.Complete {
+		pending := !cache.Complete || cache.Fetched.IsZero() || now.Sub(cache.Fetched) > tmdbCreditRefreshInterval
+		if pending {
 			progress.PendingActors++
 		}
 		if cache.Fetched.IsZero() && cache.Attempted.IsZero() && cache.Error == "" {
 			progress.UnattemptedActors++
 		}
-		ready := !cache.NextRetry.After(now) && (cache.Fetched.IsZero() || now.Sub(cache.Fetched) > 30*24*time.Hour || len(cache.Credits) == 0)
+		ready := !cache.NextRetry.After(now) && (cache.Fetched.IsZero() || now.Sub(cache.Fetched) > tmdbCreditRefreshInterval || (!cache.Complete && len(cache.Credits) == 0))
 		primary := map[string]bool{}
 		for _, id := range primaryIDs {
 			primary[id] = true
@@ -73,7 +77,7 @@ func (a *App) tmdbCreditProgress(ctx context.Context, now time.Time) (tmdbCredit
 				blocked = true
 			}
 		}
-		if !cache.Complete {
+		if pending {
 			if ready {
 				progress.ReadyActors++
 			} else {
@@ -145,7 +149,7 @@ func (c *tmdbCreditCache) selectCredits(now time.Time, budget int) map[string][]
 
 // Four actors and ten title resolutions per actor per sync, independently resumable.
 // Full credit identities are saved before any title enrichment, never inferred from crew.
-const tmdbCreditActorSelection = `SELECT p.id,p.data,COALESCE(c.value,'{}'::jsonb) FROM actresses p LEFT JOIN app_state c ON c.key='tmdb:actor:'||p.tmdb_id
+const tmdbCreditActorEligibility = `SELECT p.id,p.data,COALESCE(c.value,'{}'::jsonb) FROM actresses p LEFT JOIN app_state c ON c.key='tmdb:actor:'||p.tmdb_id
  WHERE ($2::bigint[] IS NULL OR p.id=ANY($2::bigint[])) AND COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%'
  AND COALESCE(NULLIF(c.value->>'next_retry','')::timestamptz,'-infinity'::timestamptz)<=now()
  AND (COALESCE(NULLIF(c.value->>'fetched','')::timestamptz,'-infinity'::timestamptz)<$1::timestamptz
@@ -154,8 +158,9 @@ const tmdbCreditActorSelection = `SELECT p.id,p.data,COALESCE(c.value,'{}'::json
  SELECT 1 FROM jsonb_array_elements(COALESCE(NULLIF(c.value->'credits','null'::jsonb),'[]'::jsonb)) credit
  WHERE COALESCE(credit->>'resolved','false')<>'true'
  AND (COALESCE(NULLIF(credit->>'next_retry','')::timestamptz,'-infinity'::timestamptz)<=now()
- OR EXISTS (SELECT 1 FROM releases r WHERE r.media_type=credit->>'kind' AND r.tmdb_id=credit->>'id'))))))
- ORDER BY COALESCE(NULLIF(c.value->>'attempted','')::timestamptz,'-infinity'::timestamptz),p.id LIMIT 4`
+ OR EXISTS (SELECT 1 FROM releases r WHERE r.media_type=credit->>'kind' AND r.tmdb_id=credit->>'id'))))))`
+
+const tmdbCreditActorSelection = tmdbCreditActorEligibility + ` ORDER BY COALESCE(NULLIF(c.value->>'attempted','')::timestamptz,'-infinity'::timestamptz),p.id LIMIT 4`
 
 func (a *App) syncTMDBCredits(ctx context.Context, s Settings) (int, error) {
 	return a.syncTMDBCreditsForWatches(ctx, s, nil)
@@ -165,7 +170,7 @@ func (a *App) syncTMDBCreditsForWatches(ctx context.Context, s Settings, watchID
 	if !s.TMDB.Enabled || s.TMDB.APIKey == "" {
 		return 0, nil
 	}
-	rows, e := a.db.Query(ctx, tmdbCreditActorSelection, time.Now().UTC().Add(-30*24*time.Hour).Format(time.RFC3339Nano), watchIDs)
+	rows, e := a.db.Query(ctx, tmdbCreditActorSelection, time.Now().UTC().Add(-tmdbCreditRefreshInterval).Format(time.RFC3339Nano), watchIDs)
 	if e != nil {
 		return 0, e
 	}
@@ -217,7 +222,7 @@ func (a *App) syncTMDBCreditsForWatches(ctx context.Context, s Settings, watchID
 			}
 			continue
 		}
-		if j.c.Fetched.IsZero() || time.Since(j.c.Fetched) > 30*24*time.Hour {
+		if j.c.Fetched.IsZero() || time.Since(j.c.Fetched) > tmdbCreditRefreshInterval {
 			credits, err := a.tmdbPersonCredits(ctx, s, j.p.TMDbID)
 			if err != nil {
 				j.c.Complete = false
