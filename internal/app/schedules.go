@@ -684,7 +684,7 @@ func (a *App) searchMissing(ctx context.Context, task Task) error {
 	ctx = lease.ctx
 	// Materialize and close the rows before acquiring any further pool connection.
 	// Scope is the app's monitored catalogue, not the manager's whole inventory.
-	rows, err := a.db.Query(ctx, `SELECT id,media_type,tmdb_id,imdb_id,COALESCE(data->>'tvdb_id','') FROM releases WHERE monitored ORDER BY id`)
+	rows, err := a.db.Query(ctx, `SELECT id,media_type,tmdb_id,imdb_id,COALESCE(data->>'tvdb_id','') FROM releases r WHERE monitored AND `+visibleReleasePredicate+` ORDER BY id`)
 	if err != nil {
 		return err
 	}
@@ -758,7 +758,7 @@ func (a *App) searchMissing(ctx context.Context, task Task) error {
 				return errors.New("integration configuration changed during search_missing; rerun to rematch identities")
 			}
 			var monitored bool
-			if err = a.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM releases WHERE id=$1 AND monitored AND media_type=$2 AND tmdb_id=$3 AND imdb_id=$4 AND COALESCE(data->>'tvdb_id','')=$5)`, r.ID, r.Type, r.TMDbID, r.IMDbID, r.TVDbID).Scan(&monitored); err != nil {
+			if err = a.db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM releases r WHERE id=$1 AND monitored AND `+visibleReleasePredicate+` AND media_type=$2 AND tmdb_id=$3 AND imdb_id=$4 AND COALESCE(data->>'tvdb_id','')=$5)`, r.ID, r.Type, r.TMDbID, r.IMDbID, r.TVDbID).Scan(&monitored); err != nil {
 				return err
 			}
 			if !monitored {

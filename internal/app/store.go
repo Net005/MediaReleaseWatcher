@@ -110,17 +110,20 @@ func (a *App) getActress(ctx context.Context, id int64) (Actress, error) {
 		p.UpcomingCount = 0
 		return p, nil
 	}
-	e = a.db.QueryRow(ctx, `SELECT count(*),count(*) FILTER(WHERE `+upcomingReleasePredicate+`) FROM release_people rp JOIN releases r ON r.id=rp.release_id WHERE rp.actress_id=$1`, id).Scan(&p.ReleaseCount, &p.UpcomingCount)
+	e = a.db.QueryRow(ctx, `SELECT count(*),count(*) FILTER(WHERE `+upcomingReleasePredicate+`) FROM release_people rp JOIN releases r ON r.id=rp.release_id WHERE rp.actress_id=$1 AND `+visibleReleasePredicate, id).Scan(&p.ReleaseCount, &p.UpcomingCount)
 	return p, e
 }
 
 // CASE keeps malformed or non-canonical provider dates away from the date cast.
 // UTC calendar days are intentional: a release dated today is no longer upcoming.
+// Only an explicit exact provider identity in the durable ledger excludes a title.
+const visibleReleasePredicate = `NOT EXISTS(SELECT 1 FROM app_state exclusion WHERE exclusion.key='release_exclusion:'||r.media_type||':'||r.tmdb_id)`
+
 const upcomingReleasePredicate = `CASE WHEN r.data->>'release_date' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' AND pg_input_is_valid(r.data->>'release_date','date') THEN (r.data->>'release_date')::date > (now() AT TIME ZONE 'UTC')::date ELSE false END`
 
 func (a *App) actresses(ctx context.Context, q, group string, upcomingOnly ...bool) ([]Actress, error) {
 	upcoming := len(upcomingOnly) > 0 && upcomingOnly[0]
-	rows, e := a.db.Query(ctx, `SELECT p.id FROM actresses p WHERE ($1='' OR p.data->>'name' ILIKE '%'||$1||'%') AND ($2='' OR p.data->>'group'=$2) AND (NOT $3::boolean OR (COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%' AND EXISTS(SELECT 1 FROM release_people rp JOIN releases r ON r.id=rp.release_id WHERE rp.actress_id=p.id AND `+upcomingReleasePredicate+`))) ORDER BY lower(p.data->>'name'),p.id`, q, group, upcoming)
+	rows, e := a.db.Query(ctx, `SELECT p.id FROM actresses p WHERE ($1='' OR p.data->>'name' ILIKE '%'||$1||'%') AND ($2='' OR p.data->>'group'=$2) AND (NOT $3::boolean OR (COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%' AND EXISTS(SELECT 1 FROM release_people rp JOIN releases r ON r.id=rp.release_id WHERE rp.actress_id=p.id AND `+visibleReleasePredicate+` AND `+upcomingReleasePredicate+`))) ORDER BY lower(p.data->>'name'),p.id`, q, group, upcoming)
 	if e != nil {
 		return nil, e
 	}
@@ -340,7 +343,7 @@ func (a *App) releases(ctx context.Context, f releaseFilter) (releasePage, error
 		f.Limit = 500
 	}
 	out := releasePage{Items: []Release{}, Page: f.Page, Limit: f.Limit}
-	where := `WHERE ($1='' OR r.data->>'title' ILIKE '%'||$1||'%') AND ($2='' OR $2='all' OR r.media_type=$2) AND ($3='' OR EXISTS(SELECT 1 FROM release_people rp JOIN actresses p ON p.id=rp.actress_id WHERE rp.release_id=r.id AND p.data->>'group'=$3 AND COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%')) AND ($4::bigint=0 OR EXISTS(SELECT 1 FROM release_people rp JOIN actresses p ON p.id=rp.actress_id WHERE rp.release_id=r.id AND rp.actress_id=$4 AND COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%'))`
+	where := `WHERE ` + visibleReleasePredicate + ` AND ($1='' OR r.data->>'title' ILIKE '%'||$1||'%') AND ($2='' OR $2='all' OR r.media_type=$2) AND ($3='' OR EXISTS(SELECT 1 FROM release_people rp JOIN actresses p ON p.id=rp.actress_id WHERE rp.release_id=r.id AND p.data->>'group'=$3 AND COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%')) AND ($4::bigint=0 OR EXISTS(SELECT 1 FROM release_people rp JOIN actresses p ON p.id=rp.actress_id WHERE rp.release_id=r.id AND rp.actress_id=$4 AND COALESCE(p.data->>'metadata_status','') NOT LIKE 'unavailable: identity mismatch%'))`
 	switch f.Window {
 	case "current":
 		where += ` AND nullif(r.data->>'release_date','')::date BETWEEN CURRENT_DATE-30 AND CURRENT_DATE`

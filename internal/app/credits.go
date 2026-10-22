@@ -158,6 +158,7 @@ const tmdbCreditActorEligibility = `SELECT p.id,p.data,COALESCE(c.value,'{}'::js
  SELECT 1 FROM jsonb_array_elements(COALESCE(NULLIF(c.value->'credits','null'::jsonb),'[]'::jsonb)) credit
  WHERE COALESCE(credit->>'resolved','false')<>'true'
  AND (COALESCE(NULLIF(credit->>'next_retry','')::timestamptz,'-infinity'::timestamptz)<=now()
+ OR EXISTS (SELECT 1 FROM app_state exclusion WHERE exclusion.key='release_exclusion:'|| (credit->>'kind') || ':' || (credit->>'id'))
  OR EXISTS (SELECT 1 FROM releases r WHERE r.media_type=credit->>'kind' AND r.tmdb_id=credit->>'id'))))))`
 
 const tmdbCreditActorSelection = tmdbCreditActorEligibility + ` ORDER BY COALESCE(NULLIF(c.value->>'attempted','')::timestamptz,'-infinity'::timestamptz),p.id LIMIT 4`
@@ -275,6 +276,24 @@ func (a *App) syncTMDBCreditsForWatches(ctx context.Context, s Settings, watchID
 		for i := range j.c.Credits {
 			if local[j.c.Credits[i].Kind+":"+j.c.Credits[i].ID] {
 				j.c.Credits[i].NextRetry = time.Time{}
+			}
+		}
+		// Exact exclusions are successfully handled identities, not provider failures.
+		// Resolve even a deferred credit before selecting any metadata work.
+		var excludedKeys []string
+		if err := a.db.QueryRow(ctx, `SELECT ARRAY(SELECT key FROM app_state WHERE key LIKE 'release_exclusion:%')`).Scan(&excludedKeys); err != nil {
+			return 0, err
+		}
+		excluded := make(map[string]bool, len(excludedKeys))
+		for _, key := range excludedKeys {
+			excluded[key] = true
+		}
+		for i := range j.c.Credits {
+			c := &j.c.Credits[i]
+			if excluded["release_exclusion:"+c.Kind+":"+c.ID] {
+				c.Resolved = true
+				c.Error = ""
+				c.NextRetry = time.Time{}
 			}
 		}
 		selected := j.c.selectCredits(time.Now().UTC(), 10)

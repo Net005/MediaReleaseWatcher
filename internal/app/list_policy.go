@@ -31,7 +31,7 @@ const actorMonitorGate = `EXISTS(SELECT 1 FROM release_people rp JOIN actresses 
 const listMonitorGate = `EXISTS(SELECT 1 FROM release_lists rl JOIN mdblist_lists l ON l.id=rl.list_id WHERE rl.release_id=r.id AND l.enabled AND l.monitored)`
 
 // Manual overrides remain authoritative; automatic policies only monitor upcoming titles.
-const recomputeMonitoring = `UPDATE releases r SET monitored=COALESCE(r.monitoring_override,(` + upcomingReleasePredicate + `) AND (` + listMonitorGate + ` OR ` + actorMonitorGate + `))`
+const recomputeMonitoring = `UPDATE releases r SET monitored=(` + visibleReleasePredicate + `) AND COALESCE(r.monitoring_override,(` + upcomingReleasePredicate + `) AND (` + listMonitorGate + ` OR ` + actorMonitorGate + `))`
 
 func syncListPolicies(ctx context.Context, tx pgx.Tx, s Settings) error {
 	if _, err := tx.Exec(ctx, `UPDATE mdblist_lists SET enabled=false,monitored=false,auto_add=false`); err != nil {

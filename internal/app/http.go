@@ -419,6 +419,9 @@ func (a *App) releaseDetail(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if a.rejectExcludedRelease(w, r, id) {
+		return
+	}
 	v, e := a.getRelease(r.Context(), id)
 	if e != nil {
 		resultError(w, e, "release")
@@ -429,6 +432,9 @@ func (a *App) releaseDetail(w http.ResponseWriter, r *http.Request) {
 func (a *App) patchRelease(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
+		return
+	}
+	if a.rejectExcludedRelease(w, r, id) {
 		return
 	}
 	var v struct {

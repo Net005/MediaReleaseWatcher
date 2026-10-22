@@ -63,6 +63,11 @@ func (a *App) acquire(ctx context.Context, r Release, s Settings, target string,
 
 // Restoration is explicit manual consent, never an automation or sync default.
 func (a *App) acquireWithRestore(ctx context.Context, r Release, s Settings, target string, search, restoreMonitoring bool, profile int, root string) (integrations.AddResult, error) {
+	if reason, err := a.releaseExclusion(ctx, r.Type, r.TMDbID); err != nil {
+		return integrations.AddResult{}, err
+	} else if reason != "" {
+		return integrations.AddResult{}, errors.New(reason)
+	}
 	if !oneOf(target, "radarr", "sonarr") {
 		return integrations.AddResult{}, errors.New("target must be radarr or sonarr")
 	}
@@ -131,6 +136,9 @@ func (a *App) acquireWithRestore(ctx context.Context, r Release, s Settings, tar
 func (a *App) acquireRelease(w http.ResponseWriter, r *http.Request) {
 	id, ok := pathID(w, r)
 	if !ok {
+		return
+	}
+	if a.rejectExcludedRelease(w, r, id) {
 		return
 	}
 	release, e := a.getRelease(r.Context(), id)
@@ -248,7 +256,7 @@ func (a *App) acquireActress(w http.ResponseWriter, r *http.Request) {
 }
 func (a *App) automate(ctx context.Context, s Settings, baseline bool) error {
 	// Capture decisions even while disabled: enabling later never releases historic backlog.
-	rows, e := a.db.Query(ctx, `SELECT r.id,r.monitored AND (`+actorAcquireGate+` OR `+listAcquireGate+`),r.monitored AND `+actorNotifyGate+` FROM releases r`)
+	rows, e := a.db.Query(ctx, `SELECT r.id,r.monitored AND (`+actorAcquireGate+` OR `+listAcquireGate+`),r.monitored AND `+actorNotifyGate+` FROM releases r WHERE `+visibleReleasePredicate)
 	if e != nil {
 		return e
 	}
@@ -321,6 +329,16 @@ func (a *App) automate(ctx context.Context, s Settings, baseline bool) error {
 		return e
 	}
 	for _, x := range queue {
+		var visible bool
+		if err := a.db.QueryRow(ctx, `SELECT `+visibleReleasePredicate+` FROM releases r WHERE r.id=$1`, x.release).Scan(&visible); err != nil {
+			return err
+		}
+		if !visible {
+			if _, err := a.db.Exec(ctx, `UPDATE actions SET status='skipped',error='Verified release exclusion; backlog suppressed',updated_at=now() WHERE id=$1 AND status=$2`, x.id, x.status); err != nil {
+				return err
+			}
+			continue
+		}
 		if e = ctx.Err(); e != nil {
 			return e
 		}

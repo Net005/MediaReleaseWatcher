@@ -38,6 +38,9 @@ func (a *App) releaseCast(w http.ResponseWriter, req *http.Request) {
 	if !ok {
 		return
 	}
+	if a.rejectExcludedRelease(w, req, id) {
+		return
+	}
 	r, err := a.getRelease(req.Context(), id)
 	if err != nil {
 		resultError(w, err, "release")
@@ -116,7 +119,7 @@ func (a *App) personDetail(w http.ResponseWriter, req *http.Request) {
 	respond(w, 200, map[string]any{"person": p, "releases": releases})
 }
 func (a *App) releasesForPerson(ctx context.Context, id string) ([]Release, error) {
-	rows, err := a.db.Query(ctx, releaseSelect+` WHERE NOT EXISTS(SELECT 1 FROM actresses p WHERE p.tmdb_id=$1 AND COALESCE(p.data->>'metadata_status','') LIKE 'unavailable: identity mismatch%') AND EXISTS(SELECT 1 FROM release_cast rc WHERE rc.release_id=r.id AND rc.tmdb_id=$1) ORDER BY r.id DESC`, id)
+	rows, err := a.db.Query(ctx, releaseSelect+` WHERE `+visibleReleasePredicate+` AND NOT EXISTS(SELECT 1 FROM actresses p WHERE p.tmdb_id=$1 AND COALESCE(p.data->>'metadata_status','') LIKE 'unavailable: identity mismatch%') AND EXISTS(SELECT 1 FROM release_cast rc WHERE rc.release_id=r.id AND rc.tmdb_id=$1) ORDER BY r.id DESC`, id)
 	if err != nil {
 		return nil, err
 	}
